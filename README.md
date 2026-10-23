@@ -1,0 +1,184 @@
+# 电商离线数据仓库（Hive 分层建模 + 全链路指标产出）
+
+基于 924 万条真实电商用户行为日志，在 3 节点 Hadoop/Hive 集群上从零搭建的一套离线数仓。
+覆盖 **ODS → DWD → DWS → ADS** 四层，含 14 张表、7 类主题指标，全链路建有跨层校验。
+
+> 说明：本项目为个人学习项目，集群为本地 VMware 虚拟机。所有 SQL 与调度脚本均可复现，
+> 真实开发过程中遇到的问题记录在 [`docs/03_踩坑记录.md`](docs/03_踩坑记录.md)。
+
+---
+
+## 一、项目背景
+
+电商场景下，业务方关心的指标（GMV、留存、转化漏斗、用户价值分层）散落在原始日志里，
+直接查明细表有三个问题：查询慢、口径不统一、每次都要重写 SQL。
+
+本项目做的是把这些指标**按分层模型沉淀下来**：
+明细数据只清洗一次，中间层固化主题粒度，应用层一表对一需求，业务方拿到表就能直接看数。
+
+## 二、数据源
+
+| 项目 | 说明 |
+|---|---|
+| 数据集 | Kaggle — *eCommerce behavior data from multi category store*（REES46 Marketing Platform） |
+| 时间范围 | 2019-10-01 ~ 2019-10-31（31 天） |
+| 规模 | 9,244,421 行 / 1.2 GB |
+| 字段 | `event_time, event_type, product_id, category_id, category_code, brand, price, user_id, user_session` |
+| 行为类型 | `view` 8,855,310 / `cart` 97,954 / `purchase` 291,157 |
+
+**两个必须提前知道的数据事实**（影响所有下游口径）：
+
+1. **数据没有 `quantity` 字段** —— 所以"GMV"严格含义是**成交单价之和**，不是含件数的商品交易总额。本项目所有金额字段的注释里都写明了这一点。
+2. **`category_code` 缺失 31%、`brand` 缺失 13%** —— 本项目统一保留为"未知品类/未知品牌"分组，不做丢弃，以保证各表金额加总等于大盘。
+
+## 三、技术栈与环境
+
+| 组件 | 版本 / 说明 |
+|---|---|
+| Hadoop | 3.2.x（HDFS + YARN，3 节点：hadoop1 为 NameNode + ResourceManager，hadoop2/3 为 DataNode + NodeManager） |
+| Hive | 3.1.2，Metastore 存储在 MySQL |
+| 执行引擎 | MapReduce（Spark 3.1.3 已部署，当前链路未启用） |
+| 存储格式 | ODS 为 TEXTFILE（贴源），DWD 及以上为 ORC + Snappy |
+| 调度 | Shell 脚本（`*_load.sh`），支持按天增量与全量补数两种模式 |
+| 语言 | Hive SQL + Bash |
+
+## 四、分层架构
+
+```mermaid
+flowchart TD
+    A["源数据 CSV<br/>1.2G / 924 万行"] -->|"split_source.sh<br/>按天拆成 31 个文件"| B["<b>ODS</b> 贴源层<br/>ods_user_behavior_di"]
+    B -->|"类型收敛 · 空串转 NULL<br/>主键去重 · 行守恒"| C["<b>DWD</b> 明细层<br/>dwd_user_behavior_di"]
+    C -->|"主题域聚合<br/>引入业务口径"| D["<b>DWS</b> 汇总层<br/>用户 / 商品 / 漏斗 3 张 + 维表"]
+    D -->|"一表一需求<br/>窗口函数排名 · RFM 分层"| E["<b>ADS</b> 应用层<br/>7 张报表表"]
+    E --> F["Superset 看板<br/>（规划中）"]
+
+    style A fill:#e8eaf6,stroke:#3f51b5,color:#000
+    style B fill:#e3f2fd,stroke:#1976d2,color:#000
+    style C fill:#e8f5e9,stroke:#388e3c,color:#000
+    style D fill:#fff8e1,stroke:#f9a825,color:#000
+    style E fill:#fce4ec,stroke:#c2185b,color:#000
+    style F fill:#f5f5f5,stroke:#9e9e9e,color:#000
+```
+
+### 各层职责与表清单
+
+| 层 | 表 | 粒度 | 行数 | 说明 |
+|---|---|---|---|---|
+| **ODS** | `ods_user_behavior_di` | 原始明细 | 9,244,421 | 外部表，全 STRING 贴源零加工，按 `dt` 分区 |
+| **DWD** | `dwd_user_behavior_di` | 一行一次行为 | 9,244,421 | 类型收敛 + 去重 + 空值处理，**与 ODS 行数守恒** |
+| **DWS** | `dim_user_first_active` | 用户 | 3,021,953 | 首活日维表 |
+| | `dws_user_action_day` | 用户 × 天 | 6,444,006 | |
+| | `dws_product_action_day` | 商品 × 天 | 1,267,028 | |
+| | `dws_user_funnel_day` | 天 | 31 | 同日漏斗 |
+| **ADS** | `ads_trade_overview_day` | 天 | 31 | 大盘日报 |
+| | `ads_user_funnel_day` | 天 | 31 | 漏斗与新老人群结构 |
+| | `ads_user_retention_day` | 新增日（cohort） | 31 | 留存分析 |
+| | `ads_product_rank_day` | 天 × 排名 | 1,550 | 商品 TOP 50 |
+| | `ads_category_sales_day` | 天 × 品类 | 3,843 | 品类分析（含一级品类下钻） |
+| | `ads_brand_sales_day` | 天 × 品牌 | 930 | 品牌 TOP 30 |
+| | `ads_user_value_rfm` | 用户 | 3,021,953 | RFM 价值分层 |
+
+## 五、核心口径
+
+完整口径字典见 [`docs/02_指标口径字典.md`](docs/02_指标口径字典.md)，这里列三个最容易讲错的点：
+
+**1. GMV** —— 无 `quantity` 字段，实为"成交单价之和"，非含件数的商品交易总额。所有金额字段注释均已标注。
+
+**2. 加购→支付转化率恒大于 1** —— 这不是 SQL 写错。源数据里 `cart` 事件仅占 1.06%，`purchase` 占 3.15%，大量用户浏览后直接下单、不经过加购。所以"加购→支付"不是主转化路径，主指标应看 `view_to_pay_rate`；`strict_funnel_users`（真正走完浏览→加购→支付三步的人数）才能反映加购环节的真实损耗。
+
+**3. 数据集首日的新用户是"伪新客"** —— 数据从 2019-10-01 开始，这天所有存量用户都会被判成新用户。实测该日"次日留存"8.44%，明显高于其他日期的 4~6%，正是因为这批人根本不是新客。留存表用 `is_data_start_cohort` 字段标记了该 cohort，看数时应排除。
+
+## 六、六个关键设计决策
+
+| # | 决策 | 原因 |
+|---|---|---|
+| 1 | ODS 用**外部表** | 误删表不会连带删掉 HDFS 上的原始数据 |
+| 2 | DWD **不做 WHERE 过滤** | 保证 ODS 与 DWD 行数严格守恒（9,244,421），清洗逻辑可审计 |
+| 3 | 首活日**固化成维表** | 现算 `MIN(dt)` 要全表扫描；且倒序补数时会算错——先跑 10-05 再跑 10-01，10-01 会被误判成老用户 |
+| 4 | 日常增量与历史补数**两套 SQL** | 按天循环 31 天需 143 分钟；改成 `GROUP BY dt` + 动态分区批量补数，438 秒完成（快约 19 倍） |
+| 5 | 留存**观察窗口不足置 NULL** | 数据仅 31 天，靠后的 cohort 算不出 15/30 日留存，宁可空着也不拿部分数据凑数 |
+| 6 | RFM **三个分数用三种打分法** | R 固定区间（跨月可比）；F 固定区间（离散小整数，NTILE 会把并列值随机切进不同桶）；M 用 NTILE 等频但**只对有购买行为的用户分桶**，否则 281 万未购买用户会挤满第 1 桶、让所有购买用户分数失真 |
+
+## 七、快速开始
+
+前置：Hadoop + Hive 集群可用，脚本部署到各节点的 `/home/cy/scripts/`，源数据放到 `~/project/data/`。
+
+```bash
+# 1. 拆分源数据：按天拆成 31 个文件，去表头去 \r，产出行数基准清单
+bash scripts/ods/split_source.sh
+
+# 2. ODS：建库建表 → 上传并建立分区（幂等，重复执行行数不变）
+hive -f scripts/ods/ods_ddl.sql
+bash scripts/ods/ods_load.sh
+
+# 3. DWD：建表 → 全量转换（单天用 bash scripts/dwd/dwd_load.sh 2019-10-01）
+hive -f scripts/dwd/dwd_ddl.sql
+bash scripts/dwd/dwd_load.sh all
+
+# 4. DWS：建表 → 全量汇总（首次会自动重建首活日维表）
+hive -f scripts/dws/dws_ddl.sql
+bash scripts/dws/dws_load.sh all
+
+# 5. ADS：建表 → 全量产出
+hive -f scripts/ads/ads_ddl.sql
+bash scripts/ads/ads_load.sh all
+```
+
+每个 `*_load.sh` 跑完会自动执行该层的校验，全部通过才会打印 `[PASS]`。
+
+## 八、校验体系
+
+数据分层最大的风险是"某一层算错，下游报表跟着错且没人发现"。本项目每层都建了跨层反查：
+
+| 层 | 校验规则 |
+|---|---|
+| ODS | 各分区行数与拆分清单 `_manifest.txt` 逐日比对；重复上传行数不变（幂等） |
+| DWD | ① ODS 行数 = DWD 行数 ② 主键组合唯一 ③ 输出文件数检查 |
+| DWS | ① 三表 GMV 逐日完全相等 ② 三表订单数逐日相等 ③ 漏斗表每天恰好 1 行 ④ 行数 = DWD 去重数 |
+| ADS | ① 大盘 GMV = DWS GMV = 74,948,758.44 ② 订单数 = 291,157 ③ 覆盖 31 天、榜单行数不超限 ④ 品类 GMV 合计 = 大盘（证明未知分组没丢数） ⑤ 新客+老客下单人数 = 支付人数 ⑥ 留存 cohort 数与窗口约束 ⑦ RFM 用户数 = 维表用户数 |
+
+## 九、数据结论
+
+| 指标 | 值 |
+|---|---|
+| 全月 GMV | ¥74,948,758.44 |
+| 订单数 | 291,157 |
+| 活跃用户 / 商品 | 3,021,953 / 142,473 |
+| 客单价 / ARPU | 227~296 元 / 9.7~17.1 元 |
+| 浏览→支付转化率 | 3.5% ~ 5.1% |
+| 次日留存 | 4% ~ 8%（首日 cohort 除外，见上文口径 3） |
+
+**业务洞察：**
+
+- **GMV 高度集中**：`electronics.smartphone` 单品类占全月 64.23%，未知品类占 11.2%，其余百余个品类合计不足 25%
+- **10-14 是月度峰值**（GMV 355 万），10-15 加购数达月内最高（5,515）
+- **用户价值集中在少数人**：仅 11,025 人（占活跃用户 0.36%）贡献了 1,596 万 GMV；93.1% 的用户全月未产生购买
+- **ORC + Snappy 压缩效果**：DWD 层 459.8 MB，相比 CSV 源数据 1.1 GB 节省约 58%
+
+## 十、项目结构
+
+```
+.
+├── README.md
+├── docs/
+│   ├── 01_分层设计与建模.md
+│   ├── 02_指标口径字典.md
+│   ├── 03_踩坑记录.md
+│   ├── 04_运行与校验手册.md
+│   └── notes/               # 开发过程中的学习笔记
+├── scripts/
+│   ├── ods/    split_source.sh · ods_ddl.sql · ods_load.sh · ods_add_partition.sql
+│   ├── dwd/    dwd_ddl.sql · dwd_etl.sql · dwd_load.sh
+│   ├── dws/    dws_ddl.sql · dws_dim_user.sql · dws_etl_day.sql · dws_backfill.sql · dws_load.sh
+│   └── ads/    ads_ddl.sql · ads_etl_day.sql · ads_backfill.sql
+│               ads_retention.sql · ads_rfm.sql · ads_load.sh
+└── data/
+    └── sample/ecommerce_events_sample.csv   # 1 万行样本，供快速验证
+```
+
+## 十一、后续规划
+
+- [ ] **DolphinScheduler 调度**：将 `*_load.sh` 改造成工作流节点，配置 T+1 依赖与失败告警
+- [ ] **Superset 可视化**：接入 HiveServer2，把 ADS 七张表做成看板
+- [ ] **Tez 引擎调优**：替换 MapReduce，实测 DWS/ADS 层耗时下降幅度
+- [ ] **DIM 维度层**：扩展 `dim_user_first_active` 为完整用户维度，品类维度补 SCD2 缓慢变化维
