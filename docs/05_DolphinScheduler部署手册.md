@@ -218,7 +218,8 @@ EOF
 cd /opt/dolphinscheduler
 for f in api-server master-server worker-server alert-server; do
   # 切换到 mysql profile
-  sed -i 's|spring.profiles.active: postgresql|spring.profiles.active: mysql|' $f/conf/application.yaml
+  # 注意：yaml 是多行嵌套，写成 "spring.profiles.active" 匹配不到（中间有换行）
+  sed -i 's|^    active: postgresql|    active: mysql|' $f/conf/application.yaml
   # 数据库连接
   sed -i 's|jdbc:mysql://127.0.0.1:3306/dolphinscheduler|jdbc:mysql://hadoop1:3306/dolphinscheduler?useUnicode=true\&characterEncoding=UTF-8\&useSSL=false\&allowPublicKeyRetrieval=true\&serverTimezone=Asia/Shanghai|' $f/conf/application.yaml
   sed -i 's|    username: root|    username: ds|' $f/conf/application.yaml
@@ -237,11 +238,19 @@ sed -i 's|    password: root|    password: Ds@123456|' tools/conf/application.ya
 
 ```bash
 cd /opt/dolphinscheduler
-grep -H "profiles.active" api-server/conf/application.yaml master-server/conf/application.yaml \
-                          worker-server/conf/application.yaml alert-server/conf/application.yaml
-grep -H "jdbc:mysql" */conf/application.yaml tools/conf/application.yaml
+# profiles 是多行嵌套，必须用 -A1 看下一行，直接 grep "profiles.active" 永远匹配不到
+grep -H -A1 '^  profiles:' api-server/conf/application.yaml master-server/conf/application.yaml \
+                            worker-server/conf/application.yaml alert-server/conf/application.yaml
+grep -H "jdbc:mysql" api-server/conf/application.yaml master-server/conf/application.yaml \
+                     worker-server/conf/application.yaml alert-server/conf/application.yaml tools/conf/application.yaml
 grep -H "connect-string" */conf/application.yaml
 ```
+
+期望输出：`active: mysql`、`jdbc:mysql://hadoop1:3306/...`、`connect-string: hadoop1:2181,hadoop2:2181,hadoop3:2181`。
+
+> **关于 profile 的优先级**：环境变量 `SPRING_PROFILES_ACTIVE` **高于** yaml 里的 `spring.profiles.active`。
+> 我们在 `bin/env/dolphinscheduler_env.sh` 里已导出 `SPRING_PROFILES_ACTIVE=mysql`，所以即使 yaml 里还写着 `postgresql`，服务也会用 mysql 正常启动——这也是"配置没改全但服务照样起来"的原因。
+> 但不要依赖这个兜底：万一哪次环境变量没加载（例如直接跑 `<server>/bin/start.sh`），就会退回 postgresql 而连不上库。**两处都要改成 mysql。**
 
 ### 4.4 资源中心与 sudo（三节点都要做）
 
@@ -271,6 +280,41 @@ grep -HE "^-Xm[sxn]" master-server/bin/jvm_args_env.sh worker-server/bin/jvm_arg
 ```
 
 > master/worker 默认 4G，在 5.7G 的机器上叠加 Hadoop 进程会直接被 OOM killer 杀掉。调到 1G 后，实测内存占用：hadoop1 约 +1.8G，hadoop2/3 各 +1G。
+
+### 4.6 关闭/放宽 worker 负载保护（**必做，否则任务永远不执行**）
+
+这是本项目集群上最容易卡住的一步：服务全部正常、UI 能看到 worker 在线、工作流也能上线，
+但任务实例始终不派发，worker 日志反复刷：
+
+```
+OverLoad: the SystemMemoryUsedPercentage: 0.8155 is over then the
+maxSystemMemoryUsagePercentageThresholds 0.7
+```
+
+**根因**：DolphinScheduler 的 worker 自带过载保护，系统内存使用率超过阈值（默认 0.7）就拒绝接收任务。
+虚拟机只有 5.7G，且 Linux 会把 buff/cache 计入已用内存，实测使用率在 0.71~0.82 之间波动，**刚好卡在阈值之上**，
+于是 worker 一直处于"在线但拒单"状态。
+
+```bash
+cd /opt/dolphinscheduler
+# 阈值放宽到 0.9（保留保护能力，避免真内存耗尽时仍硬派任务）
+sed -i 's|max-system-memory-usage-percentage-thresholds: 0.7|max-system-memory-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
+# CPU 阈值同样放宽（虚拟机 CPU 负载波动大）
+sed -i 's|max-system-cpu-usage-percentage-thresholds: 0.7|max-system-cpu-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
+sed -i 's|max-jvm-cpu-usage-percentage-thresholds: 0.7|max-jvm-cpu-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
+
+grep -A9 'server-load-protection' worker-server/conf/application.yaml | grep thresholds
+```
+
+修改后**必须重启 worker 和 master**才生效：
+
+```bash
+bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh stop worker-server
+bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh start worker-server
+```
+
+> 若仍被拒绝，可临时 `enabled: false` 彻底关闭保护（生产环境不建议）。
+> 但更根本的解法是给虚拟机足够的内存——见第 10 章。
 
 ---
 
@@ -311,9 +355,19 @@ bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh start worker-server
 ### 6.2 验证
 
 ```bash
-# 进程状态
-bash /opt/dolphinscheduler/bin/status-all.sh
+# 进程状态：逐个服务查询（本机上起了哪些就查哪些）
+cd /opt/dolphinscheduler
+for s in master-server api-server alert-server worker-server; do
+  bash bin/dolphinscheduler-daemon.sh status $s
+done
+
 jps | grep -iE "ApiApplication|MasterServer|WorkerServer|AlertServer"
+```
+
+> **`status-all.sh` / `start-all.sh` 在 3.2.x 上不能用。** 它们是 3.1.x 一键部署时代的遗留脚本，
+> 强依赖已被删除的 `bin/env/install_env.sh`，执行会报
+> `/opt/dolphinscheduler/bin/env/install_env.sh: 没有那个文件或目录` + `hosts:[    ]` + `Bad port`。
+> 手动逐节点部署场景下，一律用 `dolphinscheduler-daemon.sh (start|stop|status) <服务名>`。
 
 # 端口
 ss -lntp | grep -E ':(12345|5678|1234) '
@@ -350,7 +404,8 @@ http://hadoop1:12345/dolphinscheduler/ui/
 
 项目管理 → 工作流 → 工作流定义 → 创建工作流。
 
-**全局参数**（页面右侧"全局参数"）：
+**全局参数**：点击画布右上角的**保存**按钮，在**弹出的保存对话框里**设置全局参数
+（不同版本 UI 位置略有差异，若画布右侧能找到"全局参数"面板，在那里设置效果相同）。
 
 | 参数名 | 值 | 说明 |
 |---|---|---|
@@ -370,15 +425,37 @@ http://hadoop1:12345/dolphinscheduler/ui/
 节点配置要点：
 - **运行标志**：正常（非"禁止执行"）
 - **worker 分组**：`default`
-- **失败策略**：默认"结束"（上游失败则不跑下游，符合分层依赖语义）
-- **重试次数**：可设 1~2 次，应对 YARN 瞬时资源不足
+- **失败重试次数**：1~2 次，重试间隔 1 分钟（应对 YARN 瞬时资源不足）
 
-**保存工作流时**选择租户 `cy`、执行策略"串行执行"。保存后点**上线**，再点**运行**测试。
+**保存工作流时**选择租户 `cy`，执行策略按下表选：
+
+| 选项 | 含义 | 建议 |
+|---|---|---|
+| 并行 | 多个实例同时跑 | ✗ 分层链路有依赖，不能用 |
+| **串行等待** | 新实例排队等前一实例跑完 | ✓ **推荐**（不丢调度，顺序执行） |
+| 串行抛弃 | 前一实例未跑完则丢弃新实例 | 补数场景下可用，避免积压 |
+| 串行优先 | 按优先级串行 | 本项目无需 |
+
+> 我们的脚本全是幂等设计（`INSERT OVERWRITE` + 先删后传），所以"串行等待"即使重叠也不会产生脏数据。
+
+**工作流内部的失败策略**在运行/定时时设置：选 **结束**（END）。
+含义是：链路上任一节点失败，后续节点不再执行——ODS 失败就不该跑 DWD，这正是分层依赖要的语义。
+
+保存后点**上线**，再点**运行**测试。
 
 ### 7.4 定时与补数
 
 - **定时**：工作流定义 → 定时 → 新建，cron 填 `0 10 2 * * ?`（每天 02:10 跑昨天数据）
 - **补数**：工作流定义 → 运行 → 补数，选择日期范围一次性回填历史
+
+**定时里的"失败策略"要选"继续"，不要选"结束"** —— 这是两个容易混淆的概念：
+
+| 位置 | 推荐值 | 理由 |
+|---|---|---|
+| 工作流内部（运行/定时时的失败策略） | **结束** | 上游 ODS 失败则 DWD/DWS/ADS 不再执行，防止脏数据向下游扩散 |
+| 定时调度自身的失败策略 | **继续** | 今天的实例失败了，明天的调度仍要触发。若设为"结束"，一次失败会让整个定时永久停摆，必须人工恢复 |
+
+即：**用工作流内部的"结束"保证数据正确，用定时的"继续"保证调度不中断**，再配合告警和补数机制兜底。
 
 > 补数时若历史数据量大，优先用脚本自带的 `all` 模式（批量 SQL 比按天循环快约 19 倍，见 `docs/03_踩坑记录.md`）。
 
@@ -391,6 +468,14 @@ ls /opt/dolphinscheduler/worker-server/logs/
 ```
 
 日志里应能看到：`[ODS] bizdate=2019-10-01` 以及各层校验输出。若报 `hive: command not found`，说明 4.2 的 `PATH` 没配好——检查 `bin/env/dolphinscheduler_env.sh` 是否被正确覆盖到 `<server>/conf/dolphinscheduler_env.sh`。
+
+**如果任务实例一直处于"提交成功/等待中"而从不执行**，先查 worker 日志：
+
+```bash
+grep -i "OverLoad" /opt/dolphinscheduler/worker-server/logs/dolphinscheduler-worker.log | tail -3
+```
+
+看到 `SystemMemoryUsedPercentage ... is over then ... 0.7` 就是 4.6 的负载保护在拦，按 4.6 处理。
 
 ---
 
@@ -407,6 +492,9 @@ ls /opt/dolphinscheduler/worker-server/logs/
 | 任务卡住不动 | `sudo.enable=true` 但没配免密 | 改 `sudo.enable=false`，或按 2.3 配 sudo |
 | 页面 404 | 访问路径不对 | 必须是 `/dolphinscheduler/ui/` |
 | `bash: /home/cy/scripts/...: No such file` | 脚本没同步到 worker 节点 | 按 2.2 分发 |
+| 任务一直不执行，日志刷 `OverLoad ... 0.7` | worker 过载保护拦截（内存阈值过高） | 按 4.6 放宽阈值到 0.9 并重启 worker |
+| `status-all.sh` 报 `Bad port` / `hosts:[]` | 该脚本依赖已删除的 `install_env.sh` | 改用 `dolphinscheduler-daemon.sh status <服务>` |
+| 服务明明正常但连不上库 | profile 未切换 | 见 4.3：环境变量与 yaml 两处都要是 mysql |
 
 ---
 
@@ -417,6 +505,62 @@ ls /opt/dolphinscheduler/worker-server/logs/
 - **参数化调度**：全局参数 `bizdate=$[yyyy-MM-dd-1]` 实现 T+1 增量调度，支持按日期范围补数
 - **故障自愈**：任务级重试 + 分层校验脚本（每层跑完自动核对行数/金额一致性，不一致即返回非零退出码，由调度系统判定失败）
 - **资源适配**：针对 5.7G 内存环境将 master/worker 堆内存从 4G 调优至 1G
+
+---
+
+## 10. 虚拟机资源规划（重要：当前配置已超配）
+
+### 10.1 现状诊断
+
+| 项目 | 数值 |
+|---|---|
+| 宿主机物理内存 | **15.7 GB** |
+| CPU | AMD Ryzen 9 7945HX（16 核 32 线程） |
+| 三台 VM 分配内存 | 5.7 GB × 3 = **17.1 GB** |
+| 宿主机当前可用内存 | **0.3 GB** |
+| 系统已提交内存 | **33.8 GB**（远超物理内存） |
+
+**结论：不能再加资源了——现在已经是超配状态。**
+
+三台 VM 的分配总量（17.1G）已经**超过宿主机物理内存（15.7G）**，系统正在大量使用页面文件做内存交换。
+这解释了两个此前被视为偶发的现象：
+
+- hadoop1 曾无故挂起、网卡链路 down；
+- worker 触发内存保护（第 4.6 节）——VM 内内存吃紧只是表象，宿主机层面在频繁换页，整体 IO 和响应都被拖慢。
+
+### 10.2 先做这件事：检查 VMware 内存预留
+
+VMware 给 VM 分配的内存默认是"上限"而非"独占"。但若勾选了
+**虚拟机设置 → 内存 → "预留所有客户机内存（全部锁定）"**，
+VM 会**独占**全部分配值，哪怕内部只用了 2G，宿主机也拿不回来。
+
+**务必取消勾选**（三台都要检查），让 VMware Tools 的内存气球机制能动态回收。这是零成本的改善。
+
+> 修改内存配置需**关机**（挂起状态下不可改）。
+
+### 10.3 三个方案
+
+| 方案 | 配置 | 代价 | 适用 |
+|---|---|---|---|
+| A. 立即优化（免费） | 取消内存预留；hadoop1 6G / hadoop2 3.5G / hadoop3 3.5G（共 13G）；不用时挂起闲置 VM | 0 元，需 10 分钟 | 现在就做 |
+| **B. 加内存条（推荐）** | 16G → **32G**，然后 hadoop1 8G / hadoop2 6G / hadoop3 6G（共 20G） | 约 200~350 元 | 一劳永逸 |
+| C. 压缩 VM | hadoop1 5G / hadoop2 3G / hadoop3 3G（共 11G） | 免费但捉襟见肘 | 临时应急 |
+
+**推荐 B**。这台机器的 CPU（Ryzen 9 7945HX，16 核 32 线程）性能严重过剩——三台 VM 各 4 核也只用了 12 核。
+瓶颈完全在内存，加到 32G 后整套环境（Hadoop + Hive + DS + 后续 Superset）都能从容运行，
+而且你的 CPU 撑得起更多并发。
+
+加内存前先确认机器形态：笔记本用 **DDR5 SO-DIMM**，迷你主机/台式机用 **DDR5 DIMM**，
+两条规格不同，买错装不上。
+
+### 10.4 资源变化后需要同步调整的项
+
+若最终调整了 VM 内存，记得同步改：
+
+1. **YARN 容器内存**（`yarn-site.xml`）：`yarn.nodemanager.resource.memory-mb`，
+   一般设为 VM 内存的 50%~60%；
+2. **DS 各服务 JVM**（第 4.5 节）：内存宽裕后可调回 2G；
+3. **worker 负载保护阈值**（第 4.6 节）：内存充足后可改回 0.7，保留保护能力。
 
 ---
 
