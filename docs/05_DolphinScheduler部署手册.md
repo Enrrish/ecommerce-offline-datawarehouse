@@ -408,6 +408,8 @@ http://hadoop1:12345/dolphinscheduler/ui/
 
 > `sudo.enable=false` 时租户只做标识，实际以部署用户执行；开启 sudo 后租户才真正做身份隔离。
 
+**这一步最容易漏**：租户在 DS 里建好了，但**保存工作流时下拉框默认停在 `default`**，而 `default` 是内置占位租户、不是系统用户，任务会在执行前直接被拒（见 7.6⑤）。每次保存工作流都要确认租户是 `cy`。
+
 ### 7.2 创建项目
 
 项目管理 → 创建项目，名称 `ecommerce_dw`。
@@ -567,6 +569,26 @@ done
 - **实际验证/演示一律用「补数」**：工作流定义 → 运行 → 补数，日期范围填 `2019-10-01` ~ `2019-10-31`
 - 定时可以上线展示能力，但要知道在历史数据集上它每天都会因"无当日源文件"失败，属预期行为
 
+**⑤ 租户选成了 `default`（任务还没开始执行就被拒）**
+
+现象是任务秒失败，worker 日志里：
+
+```
+TaskException: TenantCode: default doesn't exist
+    at ...TaskExecutionContextUtils.getOrCreateTenant(TaskExecutionContextUtils.java:74)
+```
+
+`default` 是 DS **内置的占位租户**（`t_ds_tenant` 里 `id=-1`），但它**不是 Linux 系统用户**。DS 的租户机制要求租户编码必须是各节点真实存在的 OS 用户——`getOrCreateTenant` 会在 worker 上校验并创建执行目录，找不到同名用户就直接抛异常，脚本一行都不会跑。
+
+两种解法：
+
+- **推荐**：工作流定义 → 编辑 → 点保存，在**保存对话框的"租户"下拉框**里选 `cy` → 重新**上线** → 再运行
+- 兜底：三台各执行 `sudo useradd -m default`，让占位租户有对应的系统用户。能立刻跑通，但租户语义混乱，不建议长期使用
+
+> 注意别混淆：**worker 分组的 `default` 是正常的默认分组，保持不变**；只有租户的 `default` 有问题。
+
+租户信息**不在工作流定义表里**（`t_ds_process_definition` 没有 tenant 字段），它存在 `t_ds_process_instance` / `t_ds_command` 的 `tenant_code`，运行时才传入。所以这个问题**改数据库没用，只能在 UI 里改**。
+
 ---
 
 ## 8. 故障排查
@@ -589,6 +611,7 @@ done
 | `Unable to instantiate SessionHiveMetaStoreClient` | 从节点 `hive-site.xml` 的元数据账号密码错 | 按 7.6① 改为 `cy/123456` |
 | ODS 报 `ecommerce_events_xxxx.csv 不存在` | worker 节点没有 split 源数据 | 按 7.6③ 分发 |
 | bizdate 是当年日期、没有数据 | 数据集是 2019 年的历史数据 | 按 7.6④ 用补数指定 2019-10 范围 |
+| `TenantCode: default doesn't exist` | 租户选了内置占位租户 `default`，它不是系统用户 | 按 7.6⑤ 在保存弹窗改租户为 `cy` |
 
 ---
 
