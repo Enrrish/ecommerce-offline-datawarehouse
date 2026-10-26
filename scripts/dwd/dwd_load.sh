@@ -17,7 +17,7 @@ set -uo pipefail
 DB="${DB:-mydb}"
 ODS="${ODS:-ods_user_behavior_di}"
 DWD="${DWD:-dwd_user_behavior_di}"
-ETL="${ETL:-/home/cy/scripts/dwd_etl.sql}"
+ETL="${ETL:-/home/cy/scripts/dwd/dwd_etl.sql}"
 WORK="${WORK:-/tmp/dwd_load_$$}"
 mkdir -p "$WORK"
 

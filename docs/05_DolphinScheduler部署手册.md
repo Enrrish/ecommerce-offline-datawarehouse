@@ -489,6 +489,84 @@ grep -i "OverLoad" /opt/dolphinscheduler/worker-server/logs/dolphinscheduler-wor
 
 看到 `SystemMemoryUsedPercentage ... is over then ... 0.7` 就是 4.6 的负载保护在拦，按 4.6 处理。
 
+### 7.6 首次运行失败实录：`exitStatusCode:127`
+
+工作流 2 秒内失败、任务实例 `state=6`，看 UI 只能看到"失败"两个字。**真正的报错在 worker 日志里**，最快的定位方式是直接查元数据库：
+
+```bash
+mysql -uds -p'Ds@123456' dolphinscheduler -e "
+SELECT id,name,state,start_time,end_time,host FROM t_ds_process_instance ORDER BY id DESC LIMIT 5\G"
+
+# 再到 host 指向的那台 worker 上看日志
+grep -E "exitStatusCode|rawScript" /opt/dolphinscheduler/worker-server/logs/dolphinscheduler-worker.log | tail -5
+```
+
+`exitStatusCode:127` 是 shell 的 **command not found**（126 是无执行权限，1 是脚本内逻辑失败，靠退出码就能先分流）。
+
+本次实测暴露四个叠加问题，按严重度排列：
+
+**① 从节点 Hive 连不上元数据（最隐蔽，会让 DWD/DWS/ADS 全挂）**
+
+hadoop2/3 的 `hive-site.xml` 里写的是 `root/root`，而实际 MySQL 密码是 `123456`。现象是 `Unable to instantiate SessionHiveMetaStoreClient`——看起来像 Metastore 服务没起，其实是账号密码错。
+
+```bash
+# hadoop2/3 各执行一次（hadoop2 的 /opt/hive/conf 属 root，需 sudo）
+CONF=/opt/hive/conf/hive-site.xml
+cp $CONF ${CONF}.bak.$(date +%s)
+sed -i "/<name>javax.jdo.option.ConnectionUserName<\/name>/{n;s|<value>[^<]*|<value>cy|}" $CONF
+sed -i "/<name>javax.jdo.option.ConnectionPassword<\/name>/{n;s|<value>[^<]*|<value>123456|}" $CONF
+
+# 验证（应返回 188895）
+hive -S -e 'SELECT COUNT(1) FROM mydb.dws_user_action_day WHERE dt="2019-10-01";'
+```
+
+> 三台都是嵌入式直连 MySQL。生产环境更规范的做法是在 hadoop1 起 `hive --service metastore`（9083），各节点配 `hive.metastore.uris=thrift://hadoop1:9083`——但 hadoop1 内存已吃紧（见第 10 章），当前阶段先保证跑通。
+
+**② 脚本目录是扁平的，而任务里填的是分层路径**
+
+历史遗留：`/home/cy/scripts/` 下所有脚本混在一起，只有 `ads/`、`ops/` 是子目录。按 2.2 重建分层目录，并同步修正脚本内的硬编码路径（这一步容易漏，漏了就会报找不到 SQL 文件）：
+
+```bash
+cd /home/cy/scripts
+mkdir -p ods dwd dws
+mv split_source.sh ods_ddl.sql ods_load.sh ods_add_partition.sql ods/ 2>/dev/null
+mv dwd_ddl.sql dwd_etl.sql dwd_load.sh dwd/ 2>/dev/null
+mv dws_ddl.sql dws_dim_user.sql dws_etl_day.sql dws_backfill.sql dws_load.sh dws/ 2>/dev/null
+
+# 同步修正脚本内硬编码的绝对路径
+sed -i 's|/home/cy/scripts/dwd_etl.sql|/home/cy/scripts/dwd/dwd_etl.sql|' dwd/dwd_load.sh
+sed -i 's|/home/cy/scripts/dws_|/home/cy/scripts/dws/dws_|g' dws/dws_load.sh
+
+# 分发到 worker 节点并清理旧的扁平文件
+for h in hadoop2 hadoop3; do
+  scp -rq ods dwd dws ads ops $h:/home/cy/scripts/
+  ssh $h "cd /home/cy/scripts && rm -f split_source.sh ods_*.sql ods_load.sh dwd_*.sql dwd_load.sh dws_*.sql dws_load.sh"
+done
+```
+
+**③ worker 节点没有源数据**
+
+ODS 层要读本地 CSV 再 `hadoop fs put`，而 `split/` 只在 hadoop1 有。任务被随机派到 hadoop2/3 就会失败：
+
+```bash
+for h in hadoop2 hadoop3; do
+  ssh $h "mkdir -p /home/cy/project/data"
+  scp -rq /home/cy/project/data/split $h:/home/cy/project/data/
+done
+```
+
+约 1.2G × 2，本机千兆网络约 1~2 分钟。三台各占 1.2G 磁盘，当前剩余 22G+ 无压力。
+
+**④ bizdate 算出来是 2026-10-25，但数据集是 2019 年 10 月**
+
+`$[yyyy-MM-dd-1]` 按**当前系统时间**取昨天，得到的是 2026 年的日期，而源数据只有 2019-10-01~10-31，ODS 会因为找不到 `ecommerce_events_2026-10-25.csv` 而失败。
+
+这不是配置错误，是历史数据集的固有矛盾。处理方式：
+
+- **全局参数继续保留 `$[yyyy-MM-dd-1]`**——T+1 语义是对的，简历上要的就是这个
+- **实际验证/演示一律用「补数」**：工作流定义 → 运行 → 补数，日期范围填 `2019-10-01` ~ `2019-10-31`
+- 定时可以上线展示能力，但要知道在历史数据集上它每天都会因"无当日源文件"失败，属预期行为
+
 ---
 
 ## 8. 故障排查
@@ -507,6 +585,10 @@ grep -i "OverLoad" /opt/dolphinscheduler/worker-server/logs/dolphinscheduler-wor
 | 任务一直不执行，日志刷 `OverLoad ... 0.7` | worker 过载保护拦截（内存阈值过高） | 按 4.6 放宽阈值到 0.9 并重启 worker |
 | `status-all.sh` 报 `Bad port` / `hosts:[]` | 该脚本依赖已删除的 `install_env.sh` | 改用 `dolphinscheduler-daemon.sh status <服务>` |
 | 服务明明正常但连不上库 | profile 未切换 | 见 4.3：环境变量与 yaml 两处都要是 mysql |
+| `exitStatusCode:127` | 命令/脚本不存在（126=无权限，1=逻辑失败） | 按 7.6 逐条排查 |
+| `Unable to instantiate SessionHiveMetaStoreClient` | 从节点 `hive-site.xml` 的元数据账号密码错 | 按 7.6① 改为 `cy/123456` |
+| ODS 报 `ecommerce_events_xxxx.csv 不存在` | worker 节点没有 split 源数据 | 按 7.6③ 分发 |
+| bizdate 是当年日期、没有数据 | 数据集是 2019 年的历史数据 | 按 7.6④ 用补数指定 2019-10 范围 |
 
 ---
 

@@ -16,14 +16,14 @@ set -uo pipefail
 
 DB="${DB:-mydb}"
 DWD="${DWD:-dwd_user_behavior_di}"
-ETL="${ETL:-/home/cy/scripts/dws_etl_day.sql}"
-DIM_SQL="${DIM_SQL:-/home/cy/scripts/dws_dim_user.sql}"
+ETL="${ETL:-/home/cy/scripts/dws/dws_etl_day.sql}"
+DIM_SQL="${DIM_SQL:-/home/cy/scripts/dws/dws_dim_user.sql}"
 WORK="${WORK:-/tmp/dws_load_$$}"
 mkdir -p "$WORK"
 
 # ---------- 前置：表必须已建 ----------
 if ! hive -e "USE $DB; SHOW TABLES LIKE 'dws_user_action_day';" 2>/dev/null | grep -q dws_user_action_day; then
-    echo "[ERROR] DWS 表不存在，请先执行：hive -f /home/cy/scripts/dws_ddl.sql"
+    echo "[ERROR] DWS 表不存在，请先执行：hive -f /home/cy/scripts/dws/dws_ddl.sql"
     exit 1
 fi
 
