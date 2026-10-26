@@ -297,21 +297,28 @@ maxSystemMemoryUsagePercentageThresholds 0.7
 
 ```bash
 cd /opt/dolphinscheduler
-# 阈值放宽到 0.9（保留保护能力，避免真内存耗尽时仍硬派任务）
-sed -i 's|max-system-memory-usage-percentage-thresholds: 0.7|max-system-memory-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
-# CPU 阈值同样放宽（虚拟机 CPU 负载波动大）
-sed -i 's|max-system-cpu-usage-percentage-thresholds: 0.7|max-system-cpu-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
-sed -i 's|max-jvm-cpu-usage-percentage-thresholds: 0.7|max-jvm-cpu-usage-percentage-thresholds: 0.9|' worker-server/conf/application.yaml master-server/conf/application.yaml
+# === 所有节点、所有服务都要改（漏一个就是一个隐形杀手）===
+# 内存/系统CPU：hadoop2/3 放宽到 0.9；hadoop1 承载服务最多，master/api/alert 单独放到 0.95
+sed -i 's|max-system-memory-usage-percentage-thresholds: 0.7|max-system-memory-usage-percentage-thresholds: 0.9|' */conf/application.yaml
+sed -i 's|max-system-cpu-usage-percentage-thresholds: 0.7|max-system-cpu-usage-percentage-thresholds: 0.9|' */conf/application.yaml
+# JVM CPU：worker 冷启动时 JIT 会让 CPU 瞬间冲到 90%+，放宽到 0.95 避免启动期误拦
+sed -i 's|max-jvm-cpu-usage-percentage-thresholds: 0.7|max-jvm-cpu-usage-percentage-thresholds: 0.95|' */conf/application.yaml
+# hadoop1 的 master/api/alert 内存阈值再提一档
+sed -i 's|max-system-memory-usage-percentage-thresholds: 0.9|max-system-memory-usage-percentage-thresholds: 0.95|' master-server/conf/application.yaml api-server/conf/application.yaml alert-server/conf/application.yaml
 
-grep -A9 'server-load-protection' worker-server/conf/application.yaml | grep thresholds
+grep -hE 'thresholds' */conf/application.yaml | sort -u    # 核对最终值
 ```
 
-修改后**必须重启 worker 和 master**才生效：
+修改后**必须重启对应服务**才生效：
 
 ```bash
 bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh stop worker-server
 bash /opt/dolphinscheduler/bin/dolphinscheduler-daemon.sh start worker-server
 ```
+
+**血泪教训（本项目实测）**：只改 worker 不改 master 是不够的——master 也有同样的负载保护，
+master 被拦的后果是**整个工作流不触发**（比 worker 拒单更隐蔽，worker 日志什么都看不到）。
+本集群 hadoop1 的 master 实测内存读数 0.92+，用 0.9 都会拦，所以 master 侧必须 0.95。
 
 > 若仍被拒绝，可临时 `enabled: false` 彻底关闭保护（生产环境不建议）。
 > 但更根本的解法是给虚拟机足够的内存——见第 10 章。
@@ -369,10 +376,15 @@ jps | grep -iE "ApiApplication|MasterServer|WorkerServer|AlertServer"
 > `/opt/dolphinscheduler/bin/env/install_env.sh: 没有那个文件或目录` + `hosts:[    ]` + `Bad port`。
 > 手动逐节点部署场景下，一律用 `dolphinscheduler-daemon.sh (start|stop|status) <服务名>`。
 
-# 端口
-ss -lntp | grep -E ':(12345|5678|1234) '
+**端口检查**：
 
-# 日志（启动慢时看这里）
+```bash
+ss -lntp | grep -E ':(12345|5678|1234) '
+```
+
+**日志（启动慢时看这里）**：
+
+```bash
 tail -f /opt/dolphinscheduler/api-server/logs/api-server-hadoop1.out
 tail -f /opt/dolphinscheduler/master-server/logs/master-server-hadoop1.out
 tail -f /opt/dolphinscheduler/worker-server/logs/worker-server-hadoop2.out
@@ -561,6 +573,72 @@ VM 会**独占**全部分配值，哪怕内部只用了 2G，宿主机也拿不�
    一般设为 VM 内存的 50%~60%；
 2. **DS 各服务 JVM**（第 4.5 节）：内存宽裕后可调回 2G；
 3. **worker 负载保护阈值**（第 4.6 节）：内存充足后可改回 0.7，保留保护能力。
+
+---
+
+## 11. 运维脚本与开机自启
+
+### 11.1 一键启停 + 自检脚本
+
+脚本位置：`/home/cy/scripts/ops/dw-cluster.sh`（三节点各一份，已同步）。
+**全集群命令只在 hadoop1 上执行**（内部通过 SSH 控制其他节点）。
+
+| 命令 | 作用 |
+|---|---|
+| `bash dw-cluster.sh start` | 全链路启动：ZK(3台) → HDFS/YARN → 等 safemode 退出 → DS master/api/alert → 等 api 端口 → DS worker，最后自动跑一遍 check |
+| `bash dw-cluster.sh stop` | 逆序停止 |
+| `bash dw-cluster.sh restart` | 先 stop 再 start |
+| `bash dw-cluster.sh status` | 各节点 jps 进程 + DS 服务 RUNNING/STOP 一览 |
+| `bash dw-cluster.sh check` | 深度自检，7 个维度（见下） |
+| `bash dw-cluster.sh node-start/stop` | 只管本机服务，供 systemd 调用 |
+
+`check` 的 7 个维度：ZK 角色与 quorum、MySQL 3306 可达、HDFS safemode 与 Live datanodes、
+YARN NodeManager 数、DS 五个进程、四个端口 + UI HTTP 探活（期望 200）、
+**worker/master 最近 10 分钟的 OverLoad 拦截检测**（只看最近 10 分钟，避免历史日志误导）。
+
+### 11.2 开机自启（systemd）
+
+原理：三台 VM 各装一个 `dw-node.service`，VM 开机后自动执行 `dw-cluster.sh node-start`，
+按主机名自动判断角色（hadoop1 起 ZK→Hadoop→master/api/alert；hadoop2/3 起 ZK→等 MySQL→worker→补起 DN/NM）。
+
+**worker 节点的 DN/NM 补起逻辑**：如果 hadoop1 比 hadoop2/3 先开机，`start-dfs.sh` 远程 ssh 拉起从节点会失败，
+脚本会在 hadoop2/3 上检测本机无 DataNode/NodeManager 后用 `hdfs --daemon start datanode` 兜底补起，幂等可重复执行。
+
+三台都执行（需要 root 密码）：
+
+```bash
+sudo tee /etc/systemd/system/dw-node.service > /dev/null <<'EOF'
+[Unit]
+Description=DW cluster node services (ZooKeeper / Hadoop / DolphinScheduler)
+After=network-online.target mysqld.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cy
+ExecStart=/home/cy/scripts/ops/dw-cluster.sh node-start
+ExecStop=/home/cy/scripts/ops/dw-cluster.sh node-stop
+RemainAfterExit=yes
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable dw-node.service
+```
+
+> - `mysqld` 已是 `enabled`，开机自动拉起，`After=mysqld.service` 保证 DS 起来前元数据库可用；
+> - systemd 环境**不加载** `~/.bashrc`，脚本内已显式 `export JAVA_HOME/HADOOP_HOME`，不依赖 shell 配置；
+> - 服务已在运行时重复执行 `node-start` 是安全的（各组件自身幂等）。
+
+**验证自启**：重启一台 worker 节点（如 hadoop3），开机后约 2~3 分钟执行：
+
+```bash
+systemctl status dw-node          # 应显示 exited (RemainAfterExit)
+jps | grep -E "DataNode|NodeManager|WorkerServer"
+```
 
 ---
 
