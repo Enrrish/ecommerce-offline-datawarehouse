@@ -1,6 +1,7 @@
 # 原始数据：1.2G，超出 GitHub 单文件 100MB 限制，不入库
 # 样本数据 data/sample/ 保留，供他人复现
 data/*.csv
+!data/sample/*.csv
 data/split/
 
 # 本地弃用的旧版建表语句（已被 scripts/*/ 下的 DDL 取代）
@@ -9,8 +10,20 @@ _deprecated/
 # 运行日志与临时文件
 *.log
 *.tmp
+*.bak
+*.bak.*
+nohup.out
 /tmp/
 
-# 操作系统
+# Python 工具产生的缓存（本地辅助脚本用）
+__pycache__/
+*.pyc
+
+# 编辑器 / 操作系统
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
 .DS_Store
 Thumbs.db
