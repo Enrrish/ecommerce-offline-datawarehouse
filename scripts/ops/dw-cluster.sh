@@ -151,7 +151,11 @@ cmd_check() {
   echo "---------- 3. HDFS ----------"
   local safe live
   safe=$(hdfs dfsadmin -safemode get 2>/dev/null | grep -o 'ON\|OFF')
-  live=$(hdfs dfsadmin -report 2>/dev/null | grep -A5 "Live datanodes" | grep -cE "hadoop[0-9]")
+  # 不要用 grep -A5 去数主机名：-A5 只覆盖到第一个 DataNode 的前几行，
+  # 而 Name 行与 Hostname 行都含主机名，会恒算出 2，误报节点缺失。
+  # 直接取 "Live datanodes (N):" 里的数字最可靠。
+  live=$(hdfs dfsadmin -report 2>/dev/null | grep -m1 "^Live datanodes" | grep -oE '\([0-9]+\)' | tr -d '()')
+  live=${live:-0}
   if [ "$safe" = "OFF" ] && [ "$live" -ge 2 ]; then
     ok "safemode OFF，Live datanodes = $live/3"
   else

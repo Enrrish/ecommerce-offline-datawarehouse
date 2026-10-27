@@ -101,7 +101,9 @@ SELECT MAX(cnt), MAX(bcnt) FROM (
   UNION ALL
   SELECT dt, 0 cnt, COUNT(1) bcnt FROM ads_brand_sales_day GROUP BY dt
 ) x;
-SELECT COUNT(1) FROM ads_user_funnel_day;" 2>/dev/null | grep -E "^[0-9]" > /tmp/ads_chk_1.txt
+SELECT COUNT(1) FROM ads_user_funnel_day;
+SELECT COUNT(1) FROM (SELECT dt FROM ads_trade_overview_day GROUP BY dt HAVING COUNT(1) > 1) dup;
+SELECT COUNT(1) FROM ads_trade_overview_day WHERE dt = '$MODE';" 2>/dev/null | grep -E "^[0-9]" > /tmp/ads_chk_1.txt
 
 DWS_DAYS=$(sed -n '1p' /tmp/ads_chk_1.txt)
 DWS_GMV=$(sed -n '2p' /tmp/ads_chk_1.txt | cut -f1)
@@ -113,17 +115,37 @@ CAT_GMV=$(sed -n '4p' /tmp/ads_chk_1.txt | cut -f1)
 RANK_MAX=$(sed -n '5p' /tmp/ads_chk_1.txt | cut -f1)
 BRAND_MAX=$(sed -n '5p' /tmp/ads_chk_1.txt | cut -f2)
 FN_DAYS=$(sed -n '6p' /tmp/ads_chk_1.txt)
+OV_DUP=$(sed -n '7p' /tmp/ads_chk_1.txt)      # 出现行数 >1 的日期个数（应恒为 0）
+DT_CNT=$(sed -n '8p' /tmp/ads_chk_1.txt)      # 目标日期分区行数
 
-# 单天模式只应有 1 天数据，全量模式应覆盖 DWS 全部日期
-if [ "$MODE" = "all" ] || [ "$MODE" = "check" ]; then EXPECT="$DWS_DAYS"; else EXPECT=1; fi
+# 规则3 的语义是「每个 dt 分区内恰好 1 行」，不是「表里只有一天」。
+# ADS 按天分区，历史分区保留完全正常，单天增量后总天数必然大于 1。
+#   全量模式：覆盖天数必须等于 DWS 天数
+#   单天模式：只校验本次目标日期已产出，不校验总天数
+IS_FULL=0
+if [ "$MODE" = "all" ] || [ "$MODE" = "check" ]; then IS_FULL=1; fi
 
 [ "$DWS_GMV" = "$ADS_GMV" ] && echo "  [OK]   规则1 GMV 跨层一致 = $ADS_GMV" || { echo "  [FAIL] 规则1 GMV 不一致 dws=$DWS_GMV ads=$ADS_GMV"; BAD=$((BAD+1)); }
 [ "$DWS_ORD" = "$ADS_ORD" ] && echo "  [OK]   规则2 订单数跨层一致 = $ADS_ORD" || { echo "  [FAIL] 规则2 订单不一致 dws=$DWS_ORD ads=$ADS_ORD"; BAD=$((BAD+1)); }
 [ "$OV_DAYS" = "$FN_DAYS" ]  && echo "  [OK]   规则3 大盘/漏斗天数一致 = $OV_DAYS" || { echo "  [FAIL] 规则3 天数不一致 ov=$OV_DAYS funnel=$FN_DAYS"; BAD=$((BAD+1)); }
-if [ "$OV_DAYS" = "${EXPECT:-0}" ]; then
-    echo "  [OK]   规则3 覆盖天数 = $OV_DAYS（期望 $EXPECT）"
+if [ "${OV_DUP:-1}" = "0" ]; then
+    echo "  [OK]   规则3 大盘表每天恰好 1 行（无重复日期）"
 else
-    echo "  [FAIL] 规则3 覆盖天数=$OV_DAYS 期望=$EXPECT"; BAD=$((BAD+1))
+    echo "  [FAIL] 规则3 有 $OV_DUP 个日期行数 > 1"; BAD=$((BAD+1))
+fi
+if [ "$IS_FULL" = "1" ]; then
+    if [ "$OV_DAYS" = "$DWS_DAYS" ]; then
+        echo "  [OK]   规则3 覆盖天数 = $OV_DAYS（与 DWS 一致）"
+    else
+        echo "  [FAIL] 规则3 覆盖天数=$OV_DAYS 期望=$DWS_DAYS"; BAD=$((BAD+1))
+    fi
+else
+    # 单天增量：表内累计天数多于本次是正常的（历史分区保留），只校验目标分区已产出
+    if [ "${DT_CNT:-0}" = "1" ]; then
+        echo "  [OK]   规则3 目标分区 $MODE 已产出（表内累计 $OV_DAYS 天，历史分区保留属正常）"
+    else
+        echo "  [FAIL] 规则3 目标分区 $MODE 行数=${DT_CNT:-0}，期望 1"; BAD=$((BAD+1))
+    fi
 fi
 [ "$CAT_GMV" = "$ADS_GMV" ] && echo "  [OK]   规则4 品类 GMV 合计 = 大盘 GMV = $CAT_GMV（未知品类未丢数）" || { echo "  [FAIL] 规则4 品类 GMV=$CAT_GMV 大盘=$ADS_GMV"; BAD=$((BAD+1)); }
 if [ "${RANK_MAX:-0}" -le 50 ] && [ "${BRAND_MAX:-0}" -le 30 ]; then
