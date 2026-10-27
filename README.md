@@ -1,7 +1,8 @@
-# 电商离线数据仓库（Hive 分层建模 + 全链路指标产出）
+# 电商离线数据仓库（Hive 分层建模 + DolphinScheduler 调度）
 
 基于 924 万条真实电商用户行为日志，在 3 节点 Hadoop/Hive 集群上从零搭建的一套离线数仓。
-覆盖 **ODS → DWD → DWS → ADS** 四层，含 14 张表、7 类主题指标，全链路建有跨层校验。
+覆盖 **ODS → DWD → DWS → ADS** 四层，共 13 张表、7 类主题报表，全链路建有跨层校验，
+并用 DolphinScheduler 3.2.2 串成 T+1 工作流。
 
 > 说明：本项目为个人学习项目，集群为本地 VMware 虚拟机。所有 SQL 与调度脚本均可复现，
 > 真实开发过程中遇到的问题记录在 [`docs/03_踩坑记录.md`](docs/03_踩坑记录.md)。
@@ -35,11 +36,13 @@
 
 | 组件 | 版本 / 说明 |
 |---|---|
-| Hadoop | 3.2.x（HDFS + YARN，3 节点：hadoop1 为 NameNode + ResourceManager，hadoop2/3 为 DataNode + NodeManager） |
-| Hive | 3.1.2，Metastore 存储在 MySQL |
+| Hadoop | **3.1.3**（HDFS + YARN，3 节点：hadoop1 为 NameNode + ResourceManager，hadoop2/3 为 DataNode + NodeManager） |
+| Hive | 3.1.2，Metastore 存储在 MySQL 5.7.28 |
 | 执行引擎 | MapReduce（Spark 3.1.3 已部署，当前链路未启用） |
 | 存储格式 | ODS 为 TEXTFILE（贴源），DWD 及以上为 ORC + Snappy |
-| 调度 | Shell 脚本（`*_load.sh`），支持按天增量与全量补数两种模式 |
+| 调度 | **DolphinScheduler 3.2.2**（三节点部署，ZK 3.8.4 做注册中心） |
+| 运维 | Bash 运维脚本 `scripts/ops/dw-cluster.sh`（一键启停 + 7 项自检） |
+| 集群规格 | 3 台 VMware 虚拟机，每台 5.7 GB 内存，JDK 8 |
 | 语言 | Hive SQL + Bash |
 
 ## 四、分层架构
@@ -52,12 +55,18 @@ flowchart TD
     D -->|"一表一需求<br/>窗口函数排名 · RFM 分层"| E["<b>ADS</b> 应用层<br/>7 张报表表"]
     E --> F["Superset 看板<br/>（规划中）"]
 
+    G["DolphinScheduler 3.2.2<br/>ods_load → dwd_etl → dws_sum → ads_stat"] -.->|"T+1 串行调度"| B
+    G -.-> C
+    G -.-> D
+    G -.-> E
+
     style A fill:#e8eaf6,stroke:#3f51b5,color:#000
     style B fill:#e3f2fd,stroke:#1976d2,color:#000
     style C fill:#e8f5e9,stroke:#388e3c,color:#000
     style D fill:#fff8e1,stroke:#f9a825,color:#000
     style E fill:#fce4ec,stroke:#c2185b,color:#000
     style F fill:#f5f5f5,stroke:#9e9e9e,color:#000
+    style G fill:#ede7f6,stroke:#5e35b1,color:#000
 ```
 
 ### 各层职责与表清单
@@ -77,6 +86,8 @@ flowchart TD
 | | `ads_category_sales_day` | 天 × 品类 | 3,843 | 品类分析（含一级品类下钻） |
 | | `ads_brand_sales_day` | 天 × 品牌 | 930 | 品牌 TOP 30 |
 | | `ads_user_value_rfm` | 用户 | 3,021,953 | RFM 价值分层 |
+
+> 13 张表 = ODS 1 + DWD 1 + DWS 4（含 1 张维表）+ ADS 7。
 
 ## 五、核心口径
 
@@ -99,11 +110,50 @@ flowchart TD
 | 5 | 留存**观察窗口不足置 NULL** | 数据仅 31 天，靠后的 cohort 算不出 15/30 日留存，宁可空着也不拿部分数据凑数 |
 | 6 | RFM **三个分数用三种打分法** | R 固定区间（跨月可比）；F 固定区间（离散小整数，NTILE 会把并列值随机切进不同桶）；M 用 NTILE 等频但**只对有购买行为的用户分桶**，否则 281 万未购买用户会挤满第 1 桶、让所有购买用户分数失真 |
 
-## 七、快速开始
+## 七、调度与运维
 
-前置：Hadoop + Hive 集群可用，脚本部署到各节点的 `/home/cy/scripts/`，源数据放到 `~/project/data/`。
+### 7.1 DolphinScheduler 工作流
+
+```
+ods_load  →  dwd_etl  →  dws_sum  →  ads_stat
+ (ODS)       (DWD)       (DWS)       (ADS + 7 条校验)
+```
+
+| 配置项 | 值 | 说明 |
+|---|---|---|
+| 部署角色 | hadoop1：master / api / alert；hadoop2、hadoop3：worker | hadoop1 已承载 NameNode + RM + MySQL，不再放 worker |
+| 全局参数 | `bizdate = $[yyyy-MM-dd-1]` | T+1 跑昨天；内置 `${system.biz.date}` 是 `yyyyMMdd`，与 `dt=2019-10-01` 不匹配 |
+| 租户 | `cy` | 必须选真实 Linux 用户，`default` 是占位租户，任务会被直接拒绝 |
+| 工作流失败策略 | **结束** | 上游失败就不跑下游，保住分层依赖 |
+| 定时失败策略 | **继续** | 避免一次失败让定时永久停摆 |
+| 负载保护 | system-mem 0.90（hadoop1 侧 0.95） | 默认 0.7 在 5.7G 虚拟机上会持续拦截任务 |
+
+**一个必须记住的换算**：补数填的是**调度日**，`bizdate` 还要再减一天。
+跑业务日期 `2019-10-01`，补数日期要填 `2019-10-02`。
+
+> 完整部署过程、6 处踩坑与排障命令见 [`docs/05_DolphinScheduler部署手册.md`](docs/05_DolphinScheduler部署手册.md)。
+
+### 7.2 集群运维脚本
 
 ```bash
+bash scripts/ops/dw-cluster.sh start     # ZK → HDFS/YARN → 等 safemode 退出 → DS master/api/alert → worker
+bash scripts/ops/dw-cluster.sh check     # 7 项自检：ZK quorum / MySQL / HDFS / YARN / DS 进程 / 端口与 UI / OverLoad
+bash scripts/ops/dw-cluster.sh status
+bash scripts/ops/dw-cluster.sh stop
+```
+
+`check` 覆盖了"进程在、服务却不可用"的典型情况：DS 五个进程 RUNNING、UI 返回 200、
+HDFS 退出安全模式且 DataNode 3/3、最近 10 分钟无 OverLoad 拦截，才判定集群健康。
+
+## 八、快速开始
+
+前置：Hadoop + Hive + DolphinScheduler 集群可用，脚本部署到各节点的 `/home/cy/scripts/`，
+源数据放到 `~/project/data/`。
+
+```bash
+# 0. 启动集群并自检（ZK / HDFS / YARN / DS 一次拉起）
+bash scripts/ops/dw-cluster.sh start
+
 # 1. 拆分源数据：按天拆成 31 个文件，去表头去 \r，产出行数基准清单
 bash scripts/ods/split_source.sh
 
@@ -124,9 +174,13 @@ hive -f scripts/ads/ads_ddl.sql
 bash scripts/ads/ads_load.sh all
 ```
 
-每个 `*_load.sh` 跑完会自动执行该层的校验，全部通过才会打印 `[PASS]`。
+每个 `*_load.sh` 跑完会自动执行该层的校验，全部通过才会打印 `[PASS]`，否则以非 0 退出码结束，
+可被调度系统捕获。
 
-## 八、校验体系
+> 首次建仓或重跑历史走命令行的 `all` 模式（约 7 分钟）；DolphinScheduler 适合日常 T+1 单天调度。
+> 不要用补数一次性跑 31 天——单天全链路约 277~368 秒，31 天要 2.4 小时。
+
+## 九、校验体系
 
 数据分层最大的风险是"某一层算错，下游报表跟着错且没人发现"。本项目每层都建了跨层反查：
 
@@ -135,9 +189,9 @@ bash scripts/ads/ads_load.sh all
 | ODS | 各分区行数与拆分清单 `_manifest.txt` 逐日比对；重复上传行数不变（幂等） |
 | DWD | ① ODS 行数 = DWD 行数 ② 主键组合唯一 ③ 输出文件数检查 |
 | DWS | ① 三表 GMV 逐日完全相等 ② 三表订单数逐日相等 ③ 漏斗表每天恰好 1 行 ④ 行数 = DWD 去重数 |
-| ADS | ① 大盘 GMV = DWS GMV = 74,948,758.44 ② 订单数 = 291,157 ③ 覆盖 31 天、榜单行数不超限 ④ 品类 GMV 合计 = 大盘（证明未知分组没丢数） ⑤ 新客+老客下单人数 = 支付人数 ⑥ 留存 cohort 数与窗口约束 ⑦ RFM 用户数 = 维表用户数 |
+| ADS | ① 大盘 GMV = DWS GMV = 74,948,758.44 ② 订单数 = 291,157 ③ **每个 `dt` 分区恰好 1 行**（无重复日期）；单天模式额外校验目标分区已产出，全量模式校验覆盖 31 天 ④ 品类 GMV 合计 = 大盘（证明未知分组没丢数） ⑤ 新客+老客下单人数 = 支付人数 ⑥ 留存 cohort 数与窗口约束 ⑦ RFM 用户数 = 维表用户数 |
 
-## 九、数据结论
+## 十、数据结论
 
 | 指标 | 值 |
 |---|---|
@@ -155,30 +209,35 @@ bash scripts/ads/ads_load.sh all
 - **用户价值集中在少数人**：仅 11,025 人（占活跃用户 0.36%）贡献了 1,596 万 GMV；93.1% 的用户全月未产生购买
 - **ORC + Snappy 压缩效果**：DWD 层 459.8 MB，相比 CSV 源数据 1.1 GB 节省约 58%
 
-## 十、项目结构
+## 十一、项目结构
 
 ```
 .
 ├── README.md
+├── .gitattributes            # 行尾统一为 LF，避免 Shell 脚本出现 bad interpreter
+├── .gitignore
 ├── docs/
 │   ├── 01_分层设计与建模.md
 │   ├── 02_指标口径字典.md
 │   ├── 03_踩坑记录.md
 │   ├── 04_运行与校验手册.md
-│   └── notes/               # 开发过程中的学习笔记
+│   ├── 05_DolphinScheduler部署手册.md
+│   └── notes/                # 开发过程中的学习笔记（原始记录，部分路径为旧版）
 ├── scripts/
 │   ├── ods/    split_source.sh · ods_ddl.sql · ods_load.sh · ods_add_partition.sql
 │   ├── dwd/    dwd_ddl.sql · dwd_etl.sql · dwd_load.sh
 │   ├── dws/    dws_ddl.sql · dws_dim_user.sql · dws_etl_day.sql · dws_backfill.sql · dws_load.sh
-│   └── ads/    ads_ddl.sql · ads_etl_day.sql · ads_backfill.sql
-│               ads_retention.sql · ads_rfm.sql · ads_load.sh
+│   ├── ads/    ads_ddl.sql · ads_etl_day.sql · ads_backfill.sql
+│   │           ads_retention.sql · ads_rfm.sql · ads_load.sh
+│   └── ops/    dw-cluster.sh          # 集群一键启停 / 7 项健康自检
 └── data/
     └── sample/ecommerce_events_sample.csv   # 1 万行样本，供快速验证
 ```
 
-## 十一、后续规划
+## 十二、后续规划
 
-- [ ] **DolphinScheduler 调度**：将 `*_load.sh` 改造成工作流节点，配置 T+1 依赖与失败告警
+- [x] **DolphinScheduler 调度**：4 节点串行工作流已上线，全局参数 `bizdate` 支持 T+1 与补数
+- [ ] **定时调度**：配置每日 02:10 的 cron 与告警（工作流已就绪，定时任务尚未启用）
 - [ ] **Superset 可视化**：接入 HiveServer2，把 ADS 七张表做成看板
 - [ ] **Tez 引擎调优**：替换 MapReduce，实测 DWS/ADS 层耗时下降幅度
 - [ ] **DIM 维度层**：扩展 `dim_user_first_active` 为完整用户维度，品类维度补 SCD2 缓慢变化维
