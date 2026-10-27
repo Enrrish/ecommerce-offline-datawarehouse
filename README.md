@@ -131,6 +131,9 @@ ods_load  →  dwd_etl  →  dws_sum  →  ads_stat
 **一个必须记住的换算**：补数填的是**调度日**，`bizdate` 还要再减一天。
 跑业务日期 `2019-10-01`，补数日期要填 `2019-10-02`。
 
+工作流定义已导出为 [`scheduling/ecommerce_workflow.json`](scheduling/ecommerce_workflow.json)，
+在 DS「工作流定义 → 导入」中可直接还原四个节点与依赖关系（前提：脚本已部署到 `/home/cy/scripts/`）。
+
 > 完整部署过程、首次运行失败实录与排障命令见 [`docs/05_DolphinScheduler部署手册.md`](docs/05_DolphinScheduler部署手册.md)。
 
 ### 7.2 集群运维脚本
@@ -232,6 +235,8 @@ bash scripts/ads/ads_load.sh all
 │   ├── ads/    ads_ddl.sql · ads_etl_day.sql · ads_backfill.sql
 │   │           ads_retention.sql · ads_rfm.sql · ads_load.sh
 │   └── ops/    dw-cluster.sh          # 集群一键启停 / 7 项健康自检
+├── scheduling/
+│   └── ecommerce_workflow.json        # DS 工作流定义，可在 UI 直接导入
 └── data/
     └── sample/ecommerce_events_sample.csv   # 1 万行样本，供快速验证
 ```
