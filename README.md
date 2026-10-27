@@ -193,7 +193,7 @@ bash scripts/ads/ads_load.sh all
 |---|---|
 | ODS | 各分区行数与拆分清单 `_manifest.txt` 逐日比对；重复上传行数不变（幂等） |
 | DWD | ① ODS 行数 = DWD 行数 ② 主键组合唯一 ③ 输出文件数检查 |
-| DWS | ① 三表 GMV 逐日完全相等 ② 三表订单数逐日相等 ③ 漏斗表每天恰好 1 行 ④ 行数 = DWD 去重数 |
+| DWS | ① 用户表 GMV = 商品表 GMV（逐日） ② 两表订单数逐日相等 ③ 漏斗表每天恰好 1 行 ④ 行数 = DWD 去重数 |
 | ADS | ① 大盘 GMV = DWS GMV = 74,948,758.44 ② 订单数 = 291,157 ③ **每个 `dt` 分区恰好 1 行**（无重复日期）；单天模式额外校验目标分区已产出，全量模式校验覆盖 31 天 ④ 品类 GMV 合计 = 大盘（证明未知分组没丢数） ⑤ 新客+老客下单人数 = 支付人数 ⑥ 留存 cohort 数与窗口约束 ⑦ RFM 用户数 = 维表用户数 |
 
 ## 十、数据结论
@@ -227,7 +227,9 @@ bash scripts/ads/ads_load.sh all
 │   ├── 03_踩坑记录.md
 │   ├── 04_运行与校验手册.md
 │   ├── 05_DolphinScheduler部署手册.md
-│   └── notes/                # 开发过程中的学习笔记（原始记录，部分路径为旧版）
+│   └── notes/                # 学习笔记
+│       ├── knowledge/        # 整理过的知识卡（分层思维 + Hive/MySQL/ZK/DS/Shell）
+│       └── *.md              # 早期原始笔记（部分路径为旧版）
 ├── scripts/
 │   ├── ods/    split_source.sh · ods_ddl.sql · ods_load.sh · ods_add_partition.sql
 │   ├── dwd/    dwd_ddl.sql · dwd_etl.sql · dwd_load.sh
