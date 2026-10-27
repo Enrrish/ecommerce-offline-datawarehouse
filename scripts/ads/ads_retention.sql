@@ -18,7 +18,7 @@ USE mydb;
 
 SET hive.exec.dynamic.partition=true;
 SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.exec.parallel=false;
+SET hive.exec.parallel=true;
 SET hive.auto.convert.join=false;
 
 INSERT OVERWRITE TABLE ads_user_retention_day PARTITION (dt)

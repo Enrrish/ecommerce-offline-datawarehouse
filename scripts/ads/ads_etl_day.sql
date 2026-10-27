@@ -4,11 +4,18 @@
 --
 -- 覆盖 5 张按天分区的表；留存表与 RFM 表是全期计算，走 ads_retention.sql / ads_rfm.sql。
 -- 所有 INSERT 都是 OVERWRITE + 静态分区，幂等：同一天重跑结果不变。
+--
+-- 【为什么没改多路插入】
+--   三条商品类 INSERT 同源（dws_product_action_day），本想用
+--   FROM (...) p INSERT ... INSERT ... 只扫一次，但 Hive 3.1 的语法不允许
+--   INSERT 子句里再带 FROM（报 missing EOF at 'FROM'），子查询必须挪到共享的
+--   FROM 里，而三个分支的粒度和窗口口径不同，硬合并只能靠 UNION + tag，
+--   反而扫三遍。实测放弃，作业数不变，收益从别处拿（见 docs/06 第七节）。
 -- ==============================================================================
 
 USE mydb;
 
-SET hive.exec.parallel=false;
+SET hive.exec.parallel=true;
 SET hive.auto.convert.join=false;
 
 -- ------------------------------------------------------------------------------

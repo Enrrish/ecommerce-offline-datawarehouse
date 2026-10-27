@@ -19,7 +19,7 @@ USE mydb;
 
 SET hive.exec.dynamic.partition=true;
 SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.exec.parallel=false;
+SET hive.exec.parallel=true;
 SET hive.auto.convert.join=false;
 
 -- base：每用户全期的 最近购买日 / 购买次数 / 累计金额 / 距今天数

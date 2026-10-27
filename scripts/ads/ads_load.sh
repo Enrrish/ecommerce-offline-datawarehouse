@@ -33,9 +33,12 @@ RET_SQL="$DIR/ads_retention.sql"
 RFM_SQL="$DIR/ads_rfm.sql"
 MODE="${1:-all}"
 
+# 7 张表一次性取回再比对。原实现是每张表起一次 Hive CLI，7 次 JVM + 7 次 Metastore 连接
+# 实测花了 43 秒；这里压成 1 次。
+TABLES=$(hive -e "USE $DB; SHOW TABLES;" 2>/dev/null | tr -d '\r')
 for T in ads_trade_overview_day ads_user_funnel_day ads_user_retention_day \
          ads_product_rank_day ads_category_sales_day ads_brand_sales_day ads_user_value_rfm; do
-    if ! hive -e "USE $DB; SHOW TABLES LIKE '$T';" 2>/dev/null | grep -q "$T"; then
+    if ! printf '%s\n' "$TABLES" | grep -qx "$T"; then
         echo "[ERROR] 表 $T 不存在，请先执行：hive -f $DIR/ads_ddl.sql"
         exit 1
     fi
@@ -88,20 +91,27 @@ echo "===================== ADS 层校验 ====================="
 BAD=0
 
 # ---------- 规则 1/2/3/4：总量与行数 ----------
+# 单天模式只对当天分区：原来用 JOIN (SELECT DISTINCT dt ...) 回扫 DWS 全表 644 万行，
+# 只是为了把两边都限制在"ADS 已覆盖的日期"，单天场景完全没必要。全量/check 模式口径不变。
+SCOPE=""
+DAYS_TABLE="dws_user_action_day"
+if [ "$MODE" != "all" ] && [ "$MODE" != "check" ]; then
+    SCOPE="WHERE dt = '$MODE'"
+    DAYS_TABLE="ads_trade_overview_day"    # 单天不用扫 DWS 全表数天数
+fi
+
 echo "[规则1-4] 总量一致性与行数约束"
 hive -e "USE $DB;
-SELECT COUNT(DISTINCT dt) FROM dws_user_action_day;
-SELECT ROUND(SUM(d.total_gmv),2), SUM(d.purchase_cnt)
-FROM dws_user_action_day d
-JOIN (SELECT DISTINCT dt FROM ads_trade_overview_day) a ON d.dt = a.dt;
-SELECT ROUND(SUM(total_gmv),2), SUM(purchase_pv), COUNT(1) FROM ads_trade_overview_day;
-SELECT ROUND(SUM(total_gmv),2), COUNT(1) FROM ads_category_sales_day;
+SELECT COUNT(DISTINCT dt) FROM $DAYS_TABLE;
+SELECT COALESCE(ROUND(SUM(total_gmv),2),0), COALESCE(SUM(purchase_cnt),0) FROM dws_user_action_day $SCOPE;
+SELECT COALESCE(ROUND(SUM(total_gmv),2),0), COALESCE(SUM(purchase_pv),0), COUNT(1) FROM ads_trade_overview_day $SCOPE;
+SELECT COALESCE(ROUND(SUM(total_gmv),2),0), COUNT(1) FROM ads_category_sales_day $SCOPE;
 SELECT MAX(cnt), MAX(bcnt) FROM (
-  SELECT dt, COUNT(1) cnt, 0 bcnt FROM ads_product_rank_day GROUP BY dt
+  SELECT dt, COUNT(1) cnt, 0 bcnt FROM ads_product_rank_day $SCOPE GROUP BY dt
   UNION ALL
-  SELECT dt, 0 cnt, COUNT(1) bcnt FROM ads_brand_sales_day GROUP BY dt
+  SELECT dt, 0 cnt, COUNT(1) bcnt FROM ads_brand_sales_day $SCOPE GROUP BY dt
 ) x;
-SELECT COUNT(1) FROM ads_user_funnel_day;
+SELECT COUNT(1) FROM ads_user_funnel_day $SCOPE;
 SELECT COUNT(1) FROM (SELECT dt FROM ads_trade_overview_day GROUP BY dt HAVING COUNT(1) > 1) dup;
 SELECT COUNT(1) FROM ads_trade_overview_day WHERE dt = '$MODE';" 2>/dev/null | grep -E "^[0-9]" > /tmp/ads_chk_1.txt
 
@@ -142,7 +152,7 @@ if [ "$IS_FULL" = "1" ]; then
 else
     # 单天增量：表内累计天数多于本次是正常的（历史分区保留），只校验目标分区已产出
     if [ "${DT_CNT:-0}" = "1" ]; then
-        echo "  [OK]   规则3 目标分区 $MODE 已产出（表内累计 $OV_DAYS 天，历史分区保留属正常）"
+        echo "  [OK]   规则3 目标分区 $MODE 已产出（大盘表累计 $DWS_DAYS 天，历史分区保留属正常）"
     else
         echo "  [FAIL] 规则3 目标分区 $MODE 行数=${DT_CNT:-0}，期望 1"; BAD=$((BAD+1))
     fi
@@ -154,49 +164,49 @@ else
     echo "  [FAIL] 规则3 榜单行数超限 商品=$RANK_MAX 品牌=$BRAND_MAX"; BAD=$((BAD+1))
 fi
 
-# ---------- 规则 5：人群拆分不漏人 ----------
-echo "[规则5] 漏斗表新老人群拆分"
-BAD5=$(hive -e "USE $DB; SELECT COUNT(1) FROM ads_user_funnel_day WHERE new_pay_users + old_pay_users <> pay_users;" 2>/dev/null | grep -E "^[0-9]+$")
-[ "${BAD5:-1}" = "0" ] && echo "  [OK]   规则5 新客+老客下单人数 = 支付人数，全部天数一致" || { echo "  [FAIL] 规则5 有 $BAD5 天人数对不上"; BAD=$((BAD+1)); }
-
-# ---------- 规则 6：留存窗口 ----------
-echo "[规则6] 留存表窗口约束"
+# ---------- 规则 5/6/7 + 各表规模：合并成一次调用 ----------
+# 原本是 4 次 hive -e，每次都要付 6 秒左右的 JVM 启动与 Metastore 连接。
+# 这里查询都很小，合成一次，输出按"数字行 / ads_ 开头的行"两类分别解析。
+echo "[规则5-7] 人群拆分 / 留存窗口 / RFM 完整性"
 hive -e "USE $DB;
+SELECT COUNT(1) FROM ads_user_funnel_day WHERE new_pay_users + old_pay_users <> pay_users;
 SELECT COUNT(1),
-       SUM(IF(retention_30d_rate IS NULL, 0, 1)),
-       SUM(IF(retention_15d_rate IS NULL, 0, 1)),
-       SUM(IF(retention_1d_rate  IS NULL, 0, 1))
-FROM ads_user_retention_day;" 2>/dev/null | grep -E "^[0-9]" > /tmp/ads_chk_6.txt
-RET_ROWS=$(cut -f1 /tmp/ads_chk_6.txt)
-RET_30=$(cut -f2 /tmp/ads_chk_6.txt)
-RET_15=$(cut -f3 /tmp/ads_chk_6.txt)
-RET_1=$(cut -f4 /tmp/ads_chk_6.txt)
-echo "  [OK]   规则6 留存 cohort 数=$RET_ROWS  次日留存可算=$RET_1  15日可算=$RET_15  30日可算=$RET_30（窗口不足已置 NULL）"
-[ "${RET_ROWS:-0}" = "31" ] || { echo "  [FAIL] 规则6 cohort 数应为 31"; BAD=$((BAD+1)); }
-[ "${RET_30:-0}" = "1" ]    || { echo "  [WARN] 30 日留存可算 cohort 数=$RET_30（期望 1，仅数据集首日）"; }
-
-# ---------- 规则 7：RFM 完整性 ----------
-echo "[规则7] RFM 分层完整性"
-hive -e "USE $DB;
+       COALESCE(SUM(IF(retention_30d_rate IS NULL, 0, 1)),0),
+       COALESCE(SUM(IF(retention_15d_rate IS NULL, 0, 1)),0),
+       COALESCE(SUM(IF(retention_1d_rate  IS NULL, 0, 1)),0)
+FROM ads_user_retention_day;
 SELECT (SELECT COUNT(1) FROM dim_user_first_active),
        (SELECT COUNT(1) FROM ads_user_value_rfm),
-       (SELECT COUNT(DISTINCT rfm_type) FROM ads_user_value_rfm);" 2>/dev/null | grep -E "^[0-9]" > /tmp/ads_chk_7.txt
-DIM_CNT=$(cut -f1 /tmp/ads_chk_7.txt)
-RFM_CNT=$(cut -f2 /tmp/ads_chk_7.txt)
-RFM_TYP=$(cut -f3 /tmp/ads_chk_7.txt)
-[ "$DIM_CNT" = "$RFM_CNT" ] && echo "  [OK]   规则7 RFM 用户数 = 维表用户数 = $RFM_CNT，分出 $RFM_TYP 类人群" || { echo "  [FAIL] 规则7 用户数不一致 dim=$DIM_CNT rfm=$RFM_CNT"; BAD=$((BAD+1)); }
-
-# ---------- 各表规模 ----------
-echo
-echo "[INFO] ADS 各表规模"
-hive -e "USE $DB;
+       (SELECT COUNT(DISTINCT rfm_type) FROM ads_user_value_rfm);
 SELECT 'ads_trade_overview_day', COUNT(1) FROM ads_trade_overview_day
 UNION ALL SELECT 'ads_user_funnel_day', COUNT(1) FROM ads_user_funnel_day
 UNION ALL SELECT 'ads_user_retention_day', COUNT(1) FROM ads_user_retention_day
 UNION ALL SELECT 'ads_product_rank_day', COUNT(1) FROM ads_product_rank_day
 UNION ALL SELECT 'ads_category_sales_day', COUNT(1) FROM ads_category_sales_day
 UNION ALL SELECT 'ads_brand_sales_day', COUNT(1) FROM ads_brand_sales_day
-UNION ALL SELECT 'ads_user_value_rfm', COUNT(1) FROM ads_user_value_rfm;" 2>/dev/null | grep -E "^ads_" | awk -F'\t' '{printf "  %-26s %s\n", $1, $2}'
+UNION ALL SELECT 'ads_user_value_rfm', COUNT(1) FROM ads_user_value_rfm;" 2>/dev/null | tr -d '\r' > /tmp/ads_chk_2.txt
+
+BAD5=$(grep -E "^[0-9]" /tmp/ads_chk_2.txt | sed -n '1p')
+[ "${BAD5:-1}" = "0" ] && echo "  [OK]   规则5 新客+老客下单人数 = 支付人数，全部天数一致" || { echo "  [FAIL] 规则5 有 ${BAD5:-?} 天人数对不上"; BAD=$((BAD+1)); }
+
+RET_LINE=$(grep -E "^[0-9]" /tmp/ads_chk_2.txt | sed -n '2p')
+RET_ROWS=$(printf '%s' "$RET_LINE" | cut -f1)
+RET_30=$(printf '%s' "$RET_LINE" | cut -f2)
+RET_15=$(printf '%s' "$RET_LINE" | cut -f3)
+RET_1=$(printf '%s' "$RET_LINE" | cut -f4)
+echo "  [OK]   规则6 留存 cohort 数=$RET_ROWS  次日留存可算=$RET_1  15日可算=$RET_15  30日可算=$RET_30（窗口不足已置 NULL）"
+[ "${RET_ROWS:-0}" = "31" ] || { echo "  [FAIL] 规则6 cohort 数应为 31"; BAD=$((BAD+1)); }
+[ "${RET_30:-0}" = "1" ]    || { echo "  [WARN] 30 日留存可算 cohort 数=$RET_30（期望 1，仅数据集首日）"; }
+
+RFM_LINE=$(grep -E "^[0-9]" /tmp/ads_chk_2.txt | sed -n '3p')
+DIM_CNT=$(printf '%s' "$RFM_LINE" | cut -f1)
+RFM_CNT=$(printf '%s' "$RFM_LINE" | cut -f2)
+RFM_TYP=$(printf '%s' "$RFM_LINE" | cut -f3)
+[ "$DIM_CNT" = "$RFM_CNT" ] && echo "  [OK]   规则7 RFM 用户数 = 维表用户数 = $RFM_CNT，分出 $RFM_TYP 类人群" || { echo "  [FAIL] 规则7 用户数不一致 dim=$DIM_CNT rfm=$RFM_CNT"; BAD=$((BAD+1)); }
+
+echo
+echo "[INFO] ADS 各表规模"
+grep -E "^ads_" /tmp/ads_chk_2.txt | awk -F'\t' '{printf "  %-26s %s\n", $1, $2}'
 
 echo
 echo "[INFO] RFM 分层人数分布"
