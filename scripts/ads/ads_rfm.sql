@@ -19,7 +19,8 @@ USE mydb;
 
 SET hive.exec.dynamic.partition=true;
 SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.exec.parallel=true;
+-- 并行执行在本集群有过 ConcurrentModificationException（docs/03 第 3 条），保持关闭
+SET hive.exec.parallel=false;
 SET hive.auto.convert.join=false;
 
 -- base：每用户全期的 最近购买日 / 购买次数 / 累计金额 / 距今天数

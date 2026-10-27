@@ -18,7 +18,8 @@ USE mydb;
 
 SET hive.exec.dynamic.partition=true;
 SET hive.exec.dynamic.partition.mode=nonstrict;
-SET hive.exec.parallel=true;
+-- 并行执行在本集群有过 ConcurrentModificationException（docs/03 第 3 条），保持关闭
+SET hive.exec.parallel=false;
 SET hive.auto.convert.join=false;
 
 INSERT OVERWRITE TABLE ads_user_retention_day PARTITION (dt)

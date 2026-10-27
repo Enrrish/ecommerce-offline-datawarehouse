@@ -10,12 +10,13 @@
 --   FROM (...) p INSERT ... INSERT ... 只扫一次，但 Hive 3.1 的语法不允许
 --   INSERT 子句里再带 FROM（报 missing EOF at 'FROM'），子查询必须挪到共享的
 --   FROM 里，而三个分支的粒度和窗口口径不同，硬合并只能靠 UNION + tag，
---   反而扫三遍。实测放弃，作业数不变，收益从别处拿（见 docs/06 第七节）。
+--   反而扫三遍。实测放弃，改走“中间表 + 单次扫描”（docs/07 步骤 4）。
 -- ==============================================================================
 
 USE mydb;
 
-SET hive.exec.parallel=true;
+-- 并行执行在本集群有过 ConcurrentModificationException（docs/03 第 3 条），保持关闭
+SET hive.exec.parallel=false;
 SET hive.auto.convert.join=false;
 
 -- ------------------------------------------------------------------------------

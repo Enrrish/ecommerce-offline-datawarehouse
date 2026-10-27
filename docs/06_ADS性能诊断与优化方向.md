@@ -1,4 +1,4 @@
-# ADS 层性能诊断与 Tez 可行性评估
+# ADS 层性能诊断与优化方向
 
 > 诊断对象：2026-10-27 09:20 那次全链路运行（四层全部成功）。
 > 数据来源：DolphinScheduler 任务日志、YARN REST API、`sar` 历史采样、Hive CLI 日志、HDFS 文件统计。
@@ -11,7 +11,6 @@
 | ADS 慢是否由内存不足引起 | **不是主因** | 运行期 CPU 空闲 83%~90%、iowait 0.2%、无 OOM、当日容器被内存杀 0 次 |
 | 真正的瓶颈 | **MR 短作业数量过多**（59 个应用）+ Hive CLI 冷启动 + 重复扫描 | 平均每个作业 17.5 s、1.5 个 map、1 个 reduce，累计 CPU 仅 523 s |
 | 内存问题是否存在 | 存在，但是**配置错配的隐患**，不是本次瓶颈 | YARN 按默认 8192 MB/节点 上报，物理只有 5851 MB；swap 已用 1 GB |
-| Tez 的预期收益 | **约 2~2.5 倍**（22 分 → 8~10 分） | 消除 59 次作业级开销，改成约 19 个 DAG |
 | 只改配置与 SQL 的收益 | **约 3~4 倍**（22 分 → 6~7 分），且不动组件 | 合并 INSERT、合并 CLI、去掉全表重复扫描 |
 
 一句话：**这次慢不是"机器不够"，是"小任务太多、每次都要重新起一遍 MapReduce"。**
@@ -209,141 +208,32 @@ hive.serdes.using.metastore.for.schema
 
 本次就是按这个顺序走完的：第 2 步排除了内存，第 3、4 步锁定了"作业太小、数量太多"。
 
-## 六、Tez 评估
+## 六、优化项优先级（按收益/风险排序）
 
-### 6.1 为什么 Tez 能快
+> 原则：先动 SQL 与调用次数，不动组件、不改引擎。每项都标了"改哪里"和"预期省多少"。
 
-| 维度 | MapReduce | Tez |
-|---|---|---|
-| 执行模型 | 每个 Stage 一个独立作业，落一次 HDFS | 一个查询一个 DAG，顶点之间走内存/本地盘 |
-| AM 开销 | 每个作业一个 MRAppMaster | 每个 DAG 一个 Tez AM（可复用容器） |
-| 中间结果 | 必须写 HDFS 再读回 | 直接流水线传递，省掉落盘 |
-| 调度粒度 | 作业级 | 顶点级，可动态并行度 |
-| 容器 | 作业结束即释放 | 可跨顶点复用 |
+### 第一优先级：调用次数与重复扫描（不改语义，风险最低）
 
-RFM 那条 SQL 在 MR 下被拆成 **11 个应用**，Tez 下是 **1 个 DAG 的 12 个顶点**——这就是差距的来源。
-
-### 6.2 预期收益测算（估算，未实测）
-
-| 子阶段 | 现状 | Tez 后预估 | 依据 |
+| # | 改动 | 涉及文件 | 预期 |
 |---|---|---|---|
-| 5 张日批表 | 278 s | 90 ~ 120 s | 15 个应用 → 1~2 个 DAG |
-| 留存表 | 189 s | 80 ~ 100 s | 6 个应用 → 1 个 DAG，省 5 次 AM |
-| RFM | 294 s | 110 ~ 140 s | 11 个应用 → 1 个 DAG，省 10 次落盘 |
-| 校验 + 规模统计 | 526 s | 180 ~ 220 s | 27 个应用 → 约 10 个 DAG |
-| CLI 检查 | 43 s | 10 s | 合并成一次调用 |
-| **合计** | **1330 s** | **470 ~ 590 s（8~10 分）** | **约 2.2~2.8 倍** |
+| 1 | 表存在性检查 7 次 Hive CLI → 1 次 `SHOW TABLES` | `scripts/ads/ads_load.sh` | 省 ≈43 s |
+| 2 | 单天模式把 `dt` 条件下推，不再 `JOIN (SELECT DISTINCT dt ...)` 回扫 DWS 644 万行 | `scripts/ads/ads_load.sh` | 每次校验省 1 次全表扫 |
+| 3 | 规则 5/6/7 与各表规模合并成 1 次 `hive -e` | `scripts/ads/ads_load.sh` | 校验从 526 s 降到 1~2 个作业 |
+| 4 | 商品类 3 条 `INSERT` 合并为 1 条 `UNION ALL`（**注意**：Hive 3.1 不支持 `FROM ... INSERT ... INSERT` 多路插入，已实测报错） | `scripts/ads/ads_etl_day.sql` | 少扫 2 遍源表 |
+| 5 | 留存/RFM 只算需要的日期窗口，不做全期重算 | `scripts/ads/ads_retention.sql`、`ads_rfm.sql` | 各减 1~2 个 Stage |
 
-叠加第四节的 SQL 改造（多路插入、校验瘦身、增量留存/RFM），可以进一步压到 **300~400 s（5~7 分）**。
+### 第二优先级：作业粒度（要改 SQL 结构）
 
-注意：**Tez 不解决"校验占 40%"和"每天全期重算"这两个设计问题**，它只是把每个作业的固定成本摊薄。指望换引擎把 22 分变成 3 分不现实。
+6. 所有 `INSERT` 显式写 `DISTRIBUTE BY` 或控制 reducer 数，避免"恒 1 reducer"把 20 MB 数据串行化；
+7. 小文件合并：`hive.merge.mapfiles/mapredfiles` + `hive.merge.smallfiles.avgsize`，避免下一层输入碎成 0.38 MB/个；
+8. 校验 SQL 只查当天分区，历史分区用一次性对账脚本单独跑。
 
-### 6.3 适用条件
+### 第三优先级：可观测性（不改业务，改运维）
 
-| 条件 | 本项目情况 | 结论 |
-|---|---|---|
-| Hive 版本支持 Tez | 3.1.2，原生支持 Tez 0.9.x | 满足 |
-| Tez 与 Hadoop 版本匹配 | Hadoop 3.1.3；**官方 0.9.2 bin 包是 Hadoop 2.7.3 编译的** | **需要按 3.1.3 重新编译**，或在 0.10.x 里选对构建 |
-| 单节点可分配内存 | 5.8 GB，扣掉 OS/DS 后约 3~4 GB 可用 | 勉强够（AM 1 GB + 2~3 个 1 GB 容器） |
-| YARN 配置正确 | 当前虚报 8 GB/节点 | **必须先改**，否则 Tez 更容易触发 swap |
-| 有 Tez UI 可观测 | 当前 JobHistoryServer 未启动、ATS 未启用 | 需补，否则 DAG 出问题只能看日志 |
-| 数据量 | 全库 < 500 MB | 完全够用，Tez 对中小数据收益明显 |
+9. 启 JobHistoryServer（19888）+ ATS，拿到 counters，否则永远只能靠 `hive.log` 反推；
+10. ADS 每阶段打点（`date +%s` 写日志），避免再靠肉眼拆时间账。
 
-### 6.4 配置调整清单
-
-**第一步：先把 YARN 的账算对（不改这步，Tez 会更慢）**
-
-```xml
-<!-- yarn-site.xml，三台一致 -->
-<property><name>yarn.nodemanager.resource.memory-mb</name><value>5120</value></property>
-<property><name>yarn.nodemanager.resource.cpu-vcores</name><value>4</value></property>
-<property><name>yarn.scheduler.maximum-allocation-mb</name><value>4096</value></property>
-```
-
-**第二步：Hive 侧**
-
-```xml
-<!-- hive-site.xml -->
-<property><name>hive.execution.engine</name><value>tez</value></property>
-<property><name>hive.tez.container.size</name><value>1024</value></property>
-<property><name>hive.tez.java.opts</name><value>-Xmx819m</value></property>
-<property><name>hive.tez.auto.reducer.parallelism</name><value>true</value></property>
-<property><name>hive.tez.dynamic.partition.pruning</name><value>true</value></property>
-<property><name>hive.exec.parallel</name><value>true</value></property>
-<property><name>hive.exec.parallel.thread.number</name><value>4</value></property>
-<property><name>hive.vectorized.execution.enabled</name><value>true</value></property>
-<property><name>hive.cbo.enable</name><value>true</value></property>
-<property><name>hive.compute.query.using.stats</name><value>true</value></property>
-<property><name>hive.stats.autogather</name><value>true</value></property>
-<property><name>hive.merge.tezfiles</name><value>true</value></property>
-<property><name>hive.merge.smallfiles.avgsize</name><value>134217728</value></property>
-```
-
-**第三步：tez-site.xml**
-
-```xml
-<property><name>tez.am.resource.memory.mb</name><value>1024</value></property>
-<property><name>tez.am.java.opts</name><value>-Xmx819m</value></property>
-<property><name>tez.runtime.io.sort.mb</name><value>256</value></property>
-<property><name>tez.runtime.unordered.output.buffer.size-mb</name><value>100</value></property>
-<property><name>tez.container.max.java.heap.fraction</name><value>0.8</value></property>
-<property><name>tez.am.container.reuse.enabled</name><value>true</value></property>
-<property><name>tez.lib.uris</name><value>${fs.defaultFS}/apps/tez/tez.tar.gz</value></property>
-```
-
-**第四步：环境变量（三台 `/etc/profile.d/tez.sh`）**
-
-```bash
-export TEZ_HOME=/opt/tez
-export TEZ_CONF_DIR=$TEZ_HOME/conf
-export TEZ_JARS=$TEZ_HOME
-export HADOOP_CLASSPATH=$TEZ_CONF_DIR:$TEZ_JARS/*:$TEZ_JARS/lib/*
-```
-
-并把 `tez.tar.gz` 上传到 HDFS（`hdfs dfs -put tez.tar.gz /apps/tez/`），否则每个容器都要从本地拷 jar。
-
-**第五步：冒烟验证（不要直接跑全链路）**
-
-```bash
-# 1. 单条小查询
-hive -e "set hive.execution.engine=tez; select count(1) from mydb.ads_trade_overview_day;"
-# 2. 一条带 shuffle 的
-hive -e "set hive.execution.engine=tez; select dt,count(1) from mydb.dws_user_action_day group by dt limit 5;"
-# 3. 再跑一遍完整 ads_load.sh 单天，和 MR 的 1330 s 对比
-```
-
-### 6.5 风险与回滚
-
-| 风险 | 说明 | 应对 |
-|---|---|---|
-| 版本不匹配 | 官方 0.9.2 bin 面向 Hadoop 2.7.3，直接扔进 3.1.3 会 `NoSuchMethodError` | 按 `-Dhadoop.version=3.1.3` 重新编译，或先在小查询上验证 |
-| 内存更紧 | Tez 的 AM 与容器复用会短时占更多内存 | 先做 6.4 第一步；必要时 `hive.tez.container.size=768` |
-| 无 Tez UI | 排障只能看日志 | 启用 ATS（`yarn.timeline-service.enabled=true`）并起 JobHistoryServer |
-| 首次运行更慢 | JIT、容器预热、jar 分发 | 第二次运行才是真实水平，至少跑两轮再下结论 |
-| 回滚 | 改 `hive.execution.engine=mr` 即可，SQL 不用动 | 保留原 `hive-site.xml` 备份 |
-
-## 七、建议的执行顺序
-
-**P0（不改组件，约 1 小时，收益最大）**
-
-1. 修 YARN 内存/vcore 虚报（5120 MB / 4 核），重启 YARN；
-2. 5 条 `INSERT` 合并成多路插入，`dws_user_action_day` 与 `dws_product_action_day` 各只扫一次；
-3. 删掉 7 次 `SHOW TABLES` 循环，改成一次查询；
-4. 校验与生产合到一次 `hive -f`，减少 CLI 冷启动；
-5. 打开 `hive.exec.parallel=true`、`hive.merge.*`、`split.maxsize=128MB`。
-
-**P1（约半天）**
-
-6. 启 JobHistoryServer + ATS，补上作业级可观测性（现在连 counters 都拿不到）；
-7. 校验规则瘦身：跨层对账只对当天分区，规则 7 改查聚合结果。
-
-**P2（1~2 天，单独评估）**
-
-8. 编译并接入 Tez，先跑单天对照，再切默认引擎；
-9. 留存/RFM 改增量；
-10. 想进一步压时间，再考虑 HiveServer2 + Tez session 复用（把"每次查询一个 AM"也省掉）。
-
-## 八、附录：本次实测原始数据
+## 七、附录：本次实测原始数据
 
 ```
 # 任务耗时（DS worker 日志）
