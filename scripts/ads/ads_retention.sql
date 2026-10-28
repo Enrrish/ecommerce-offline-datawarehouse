@@ -1,6 +1,7 @@
 -- ==============================================================================
 -- ads_retention.sql —— 新增用户留存（Cohort 分析，全期重算）
--- 执行：hive -f ads_retention.sql
+-- 执行：由 ads_load.sh 合并调度；手动执行需传两个日期变量：
+--   hive --hivevar min_date=2019-10-01 --hivevar max_date=2019-10-31 -f ads_retention.sql
 --
 -- 为什么这张表不做"按天增量"：
 --   留存天然是跨天计算——10-05 新增的用户，要等到 10-12 才知道他 7 日是否留存。
@@ -12,6 +13,17 @@
 --      用 DATEDIFF(活跃日, 首活日) = N 精确匹配，不是"N 天内活跃过"的模糊口径。
 --   2) 观察窗口不足时（首活日 + N 天 > 数据最大日期）结果置 NULL，不拿部分数据凑数。
 --   3) 数据集首日的 cohort 全部是存量用户伪装的"新客"，用 is_data_start_cohort 标记。
+--
+-- 【2026-10-27 性能改造 1】COUNT(DISTINCT) → SUM(IF())：
+--   原来 5 个留存人数都用 COUNT(DISTINCT IF(diff=N, user_id, NULL))，每个 DISTINCT
+--   都要维护一份最多 300 万用户的哈希表。但 dws_user_action_day 已经按 (user_id, dt)
+--   去过重（实测 6444006 行 = 6444006 个组合），同一 cohort 内每个用户在每个 diff
+--   值上只会出现一次，DISTINCT 是多余的，改成 SUM(IF(diff=N, 1, 0)) 结果完全等价。
+-- 【2026-10-27 性能改造 2】砍掉两段白付钱的子查询：
+--   a) LEFT JOIN 的右表原来包了一层 SELECT DISTINCT user_id, dt——源表本身就唯一
+--      （见上），这一层 DISTINCT 白付一次 644 万行的 shuffle 聚合，直接读表；
+--   b) MIN(dt)/MAX(dt) 原来对 dws 全表扫一遍，而分区清单在 metastore 里现成就有，
+--      改由 ads_load.sh 从 SHOW PARTITIONS 取出后用 hivevar 传入。
 -- ==============================================================================
 
 USE mydb;
@@ -41,32 +53,25 @@ FROM (
     SELECT
         c.first_active_date                                                          AS cohort_date,
         COUNT(DISTINCT c.user_id)                                                    AS new_users,
-        IF(DATE_ADD(c.first_active_date,  1) <= b.max_dt,
-           COUNT(DISTINCT IF(DATEDIFF(a.dt, c.first_active_date) =  1, c.user_id, NULL)),
+        IF(DATE_ADD(c.first_active_date,  1) <= '${hivevar:max_date}',
+           SUM(IF(DATEDIFF(a.dt, c.first_active_date) =  1, 1, 0)),
            CAST(NULL AS BIGINT))                                                     AS retain_1d,
-        IF(DATE_ADD(c.first_active_date,  3) <= b.max_dt,
-           COUNT(DISTINCT IF(DATEDIFF(a.dt, c.first_active_date) =  3, c.user_id, NULL)),
+        IF(DATE_ADD(c.first_active_date,  3) <= '${hivevar:max_date}',
+           SUM(IF(DATEDIFF(a.dt, c.first_active_date) =  3, 1, 0)),
            CAST(NULL AS BIGINT))                                                     AS retain_3d,
-        IF(DATE_ADD(c.first_active_date,  7) <= b.max_dt,
-           COUNT(DISTINCT IF(DATEDIFF(a.dt, c.first_active_date) =  7, c.user_id, NULL)),
+        IF(DATE_ADD(c.first_active_date,  7) <= '${hivevar:max_date}',
+           SUM(IF(DATEDIFF(a.dt, c.first_active_date) =  7, 1, 0)),
            CAST(NULL AS BIGINT))                                                     AS retain_7d,
-        IF(DATE_ADD(c.first_active_date, 15) <= b.max_dt,
-           COUNT(DISTINCT IF(DATEDIFF(a.dt, c.first_active_date) = 15, c.user_id, NULL)),
+        IF(DATE_ADD(c.first_active_date, 15) <= '${hivevar:max_date}',
+           SUM(IF(DATEDIFF(a.dt, c.first_active_date) = 15, 1, 0)),
            CAST(NULL AS BIGINT))                                                     AS retain_15d,
-        IF(DATE_ADD(c.first_active_date, 30) <= b.max_dt,
-           COUNT(DISTINCT IF(DATEDIFF(a.dt, c.first_active_date) = 30, c.user_id, NULL)),
+        IF(DATE_ADD(c.first_active_date, 30) <= '${hivevar:max_date}',
+           SUM(IF(DATEDIFF(a.dt, c.first_active_date) = 30, 1, 0)),
            CAST(NULL AS BIGINT))                                                     AS retain_30d,
-        CAST(IF(c.first_active_date = b.min_dt, 1, 0) AS TINYINT)                    AS is_data_start_cohort
-    FROM (
-        SELECT MIN(dt) AS min_dt, MAX(dt) AS max_dt
-        FROM dws_user_action_day
-    ) b
-    CROSS JOIN dim_user_first_active c
-    LEFT JOIN (
-        SELECT DISTINCT user_id, dt
-        FROM dws_user_action_day
-    ) a ON c.user_id = a.user_id
-    GROUP BY c.first_active_date, b.min_dt, b.max_dt
+        CAST(IF(c.first_active_date = '${hivevar:min_date}', 1, 0) AS TINYINT)       AS is_data_start_cohort
+    FROM dim_user_first_active c
+    LEFT JOIN dws_user_action_day a ON c.user_id = a.user_id
+    GROUP BY c.first_active_date
 ) t
 ORDER BY cohort_date;
 

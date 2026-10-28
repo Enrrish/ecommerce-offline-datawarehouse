@@ -1,6 +1,10 @@
 -- ==============================================================================
 -- ads_rfm.sql —— 用户价值分层（RFM 全期快照）
--- 执行：hive -f ads_rfm.sql
+-- 执行：hive -f ads_rfm.sql --hivevar stat_date=2019-10-31
+--
+-- stat_date 由 ads_load.sh 从 SHOW PARTITIONS 取出后传入（= dws 的最大分区）。
+-- 原来这里用 CTE `SELECT MAX(dt) FROM dws_user_action_day` 取，代价是一次 644 万行全表扫描，
+-- 而分区清单在 metastore 里现成就有。手动执行时必须显式传这个变量。
 --
 -- 结果写到分区 dt = 统计截止日（即数据最大日期），重跑即覆盖，天然幂等。
 --
@@ -35,8 +39,8 @@ WITH agg AS (
     GROUP BY user_id
 ),
 bounds AS (
-    SELECT MAX(dt) AS stat_date
-    FROM dws_user_action_day
+    -- 统计截止日由外部传入，不再全表扫 MAX(dt)（见文件头说明）
+    SELECT '${hivevar:stat_date}' AS stat_date
 ),
 base AS (
     SELECT
