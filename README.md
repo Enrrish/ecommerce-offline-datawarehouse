@@ -228,8 +228,9 @@ bash scripts/ads/ads_load.sh all
 │   ├── 04_运行与校验手册.md
 │   ├── 05_DolphinScheduler部署手册.md
 │   ├── 06_ADS性能诊断与优化方向.md
-│   ├── 07_ADS_SQL优化方案.md    # 6 步改造，目标 1330 s → 550 s
+│   ├── 07_ADS_SQL优化方案.md    # 实测单天 ADS 1385 s → 1062 s（−23%）
 │   ├── 08_MR与Spark引擎评估.md  # 结论：本场景不换引擎，先做 SQL 改造
+│   ├── 09_可视化看板.md         # 静态 ECharts 看板：选型、口径、踩坑
 │   └── notes/                # 学习笔记
 │       ├── knowledge/        # 整理过的知识卡（分层思维 + Hive/MySQL/ZK/DS/Shell）
 │       └── *.md              # 早期原始笔记（部分路径为旧版）
@@ -238,8 +239,12 @@ bash scripts/ads/ads_load.sh all
 │   ├── dwd/    dwd_ddl.sql · dwd_etl.sql · dwd_load.sh
 │   ├── dws/    dws_ddl.sql · dws_dim_user.sql · dws_etl_day.sql · dws_backfill.sql · dws_load.sh
 │   ├── ads/    ads_ddl.sql · ads_etl_day.sql · ads_backfill.sql
-│   │           ads_retention.sql · ads_rfm.sql · ads_load.sh
+│   │           ads_retention.sql · ads_rfm.sql · ads_load.sh · ads_export.sh
 │   └── ops/    dw-cluster.sh          # 集群一键启停 / 7 项健康自检
+├── dashboard/                # 可视化看板（纯静态，双击 index.html 即可看）
+│   ├── index.html            # 5 个板块 11 张图
+│   ├── echarts.min.js        # 本地依赖，不依赖 CDN
+│   └── data/                 # ads_export.sh 产出的 JSON / JS
 ├── scheduling/
 │   └── ecommerce_workflow.json        # DS 工作流定义，可在 UI 直接导入
 └── data/
@@ -250,7 +255,7 @@ bash scripts/ads/ads_load.sh all
 
 - [x] **DolphinScheduler 调度**：4 节点串行工作流已上线，全局参数 `bizdate` 支持 T+1 与补数
 - [ ] **定时调度**：配置每日 02:10 的 cron 与告警（工作流已就绪，定时任务尚未启用）
-- [ ] **Superset 可视化**：接入 HiveServer2，把 ADS 七张表做成看板
+- [x] **可视化看板**：ADS 导出静态 JSON + ECharts 单页（[`docs/09`](docs/09_可视化看板.md)）。未用 Superset：环境无 python3/pip、HiveServer2 未启动、hadoop1 仅剩 1.5 GB 内存，而 ADS 全量仅 14.6 MB，静态导出的收益/成本比远高于装一套 BI
 - [x] **ADS SQL 优化**：校验合并、留存去 DISTINCT、日期下推、CLI 合并（[`docs/07`](docs/07_ADS_SQL优化方案.md)），实测单天 ADS 1385 s → 1062 s（−23%），数据指纹零漂移
 - [ ] **执行引擎评估**：已完成 MR 与 Spark 的对比（[`docs/08`](docs/08_MR与Spark引擎评估.md)）。本场景换 Spark 只提速约 30%，低于 SQL 改造的 55%，且与后者收益重叠，结论为**暂不更换**；待单天分区 > 5 GB 时重新评估
 - [ ] **DIM 维度层**：扩展 `dim_user_first_active` 为完整用户维度，品类维度补 SCD2 缓慢变化维

@@ -1,0 +1,1 @@
+window.DATA_META = {"generated_at":"2026-10-28 14:15:52","start":"2019-10-01","end":"2019-10-31","days":31,"db":"mydb"};
