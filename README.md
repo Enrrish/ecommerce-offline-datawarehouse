@@ -53,7 +53,7 @@ flowchart TD
     B -->|"类型收敛 · 空串转 NULL<br/>主键去重 · 行守恒"| C["<b>DWD</b> 明细层<br/>dwd_user_behavior_di"]
     C -->|"主题域聚合<br/>引入业务口径"| D["<b>DWS</b> 汇总层<br/>用户 / 商品 / 漏斗 3 张 + 维表"]
     D -->|"一表一需求<br/>窗口函数排名 · RFM 分层"| E["<b>ADS</b> 应用层<br/>7 张报表表"]
-    E --> F["Superset 看板<br/>（规划中）"]
+    E --> F["ECharts 看板<br/>静态导出 · 离线可看"]
 
     G["DolphinScheduler 3.2.2<br/>ods_load → dwd_etl → dws_sum → ads_stat"] -.->|"T+1 串行调度"| B
     G -.-> C
@@ -175,6 +175,9 @@ bash scripts/dws/dws_load.sh all
 # 5. ADS：建表 → 全量产出
 hive -f scripts/ads/ads_ddl.sql
 bash scripts/ads/ads_load.sh all
+
+# 6. 看板：把 ADS 结果导成静态数据文件 → 双击 dashboard/index.html 即可看
+bash scripts/ads/ads_export.sh
 ```
 
 每个 `*_load.sh` 跑完会自动执行该层的校验，全部通过才会打印 `[PASS]`，否则以非 0 退出码结束，
@@ -183,7 +186,7 @@ bash scripts/ads/ads_load.sh all
 > 历史回填走命令行的 `all` 模式（批量 SQL 比按天循环快约 19 倍），逐层耗时见
 > [`docs/04_运行与校验手册.md`](docs/04_运行与校验手册.md) 第四节。
 > 不要用调度补数一次性跑 31 天——ADS 的留存表与 RFM 表每次都要全期重算，
-> 单天全链路实测约 30 分钟，31 天按天跑要十几个小时。
+> 单天全链路实测约 26 分钟（1567 s），31 天按天跑要十几个小时。
 
 ## 九、校验体系
 
@@ -228,7 +231,7 @@ bash scripts/ads/ads_load.sh all
 │   ├── 04_运行与校验手册.md
 │   ├── 05_DolphinScheduler部署手册.md
 │   ├── 06_ADS性能诊断与优化方向.md
-│   ├── 07_ADS_SQL优化方案.md    # 实测单天 ADS 1385 s → 1062 s（−23%）
+│   ├── 07_ADS_SQL优化方案.md    # 单天 ADS 1385 s → 1062 s；生产复跑 1302 s → 1024 s
 │   ├── 08_MR与Spark引擎评估.md  # 结论：本场景不换引擎，先做 SQL 改造
 │   ├── 09_可视化看板.md         # 静态 ECharts 看板：选型、口径、踩坑
 │   └── notes/                # 学习笔记
@@ -256,6 +259,6 @@ bash scripts/ads/ads_load.sh all
 - [x] **DolphinScheduler 调度**：4 节点串行工作流已上线，全局参数 `bizdate` 支持 T+1 与补数
 - [ ] **定时调度**：配置每日 02:10 的 cron 与告警（工作流已就绪，定时任务尚未启用）
 - [x] **可视化看板**：ADS 导出静态 JSON + ECharts 单页（[`docs/09`](docs/09_可视化看板.md)）。未用 Superset：环境无 python3/pip、HiveServer2 未启动、hadoop1 仅剩 1.5 GB 内存，而 ADS 全量仅 14.6 MB，静态导出的收益/成本比远高于装一套 BI
-- [x] **ADS SQL 优化**：校验合并、留存去 DISTINCT、日期下推、CLI 合并（[`docs/07`](docs/07_ADS_SQL优化方案.md)），实测单天 ADS 1385 s → 1062 s（−23%），数据指纹零漂移
+- [x] **ADS SQL 优化**：校验合并、留存去 DISTINCT、日期下推、CLI 合并（[`docs/07`](docs/07_ADS_SQL优化方案.md)），单天对照 1385 s → 1062 s（−23%），数据指纹零漂移；脚本同步到执行节点后**生产复跑 1302 s → 1024 s（17m04s，−21.4%）**
 - [ ] **执行引擎评估**：已完成 MR 与 Spark 的对比（[`docs/08`](docs/08_MR与Spark引擎评估.md)）。本场景换 Spark 只提速约 30%，低于 SQL 改造的 55%，且与后者收益重叠，结论为**暂不更换**；待单天分区 > 5 GB 时重新评估
 - [ ] **DIM 维度层**：扩展 `dim_user_first_active` 为完整用户维度，品类维度补 SCD2 缓慢变化维
