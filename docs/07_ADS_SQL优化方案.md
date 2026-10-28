@@ -232,8 +232,21 @@ SET hive.merge.smallfiles.avgsize=33554432;           -- 合并 32MB 以下小�
 
 数据指纹法：对 7 张表按行聚合取 `MD5(CONCAT_WS(...))`（榜单类先 `SORT_ARRAY(COLLECT_LIST(...))` 消除顺序影响），改前采一次、改后各采一次比对。
 
-- 第一轮（改动 1/3/4/6 部署后）：**8 项指纹与基线完全一致**
-- 第二轮（改动 5 部署后完整重跑）：校验规则 1-7 全过，指纹比对一致
+- 第一轮（校验合并/留存 SUM(IF)/日期下推部署后）：**8 项指纹与基线完全一致**
+- 第二轮（砍掉 DISTINCT 包装后完整重跑）：**7 项一致，retention 一项不同——深挖后确认是旧 SQL 算错了，新结果才是对的**（详见 5.6）
+
+### 5.6 意外收获：修掉了一个留存人数静默少算一半的 bug
+
+第二轮指纹比对发现 retention 表 MD5 变了。逐层排查（每步都有独立证据）：
+
+1. 源表唯一性复核：`COUNT(1) = COUNT(DISTINCT concat(user_id,'|',dt)) = 6444006`，排除重复行；
+2. 真值裁决：cohort 2019-10-01 次日留存，用「分区过滤 + join + COUNT(1)」和「+ COUNT(DISTINCT)」两种独立写法都算出 **31919**，当前表（新 SQL 写入）= 31919，旧 SQL = **15945（少一半）**；
+3. 子查询隔离：旧 SQL 的 `SELECT DISTINCT user_id, dt` 单独跑结果正确 → 问题不在子查询；
+4. 决定性实验：旧 SQL + `SET hive.optimize.countdistinct=false` → **31919，正确**。
+
+**根因**：`hive.optimize.countdistinct=true`（Hive 3 默认开启）对「GROUP BY + COUNT(DISTINCT) 混合普通聚合（SUM(IF(...))）」的两阶段改写会把普通聚合算错。这是历史遗留 bug：基线留存数据从第一次跑就是少的，且从未报错。新 SQL 用 `SUM(IF(...))` 计数、不含 `COUNT(DISTINCT)` 混用，天然绕开该改写。完整案例见 `docs/03` 第 16 条。
+
+**对账结论**：新 SQL 的留存数据 = 真值；其余 6 张表指纹与基线一致（未受影响）。
 
 ### 5.5 与预期目标的差距说明
 

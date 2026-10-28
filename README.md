@@ -251,6 +251,6 @@ bash scripts/ads/ads_load.sh all
 - [x] **DolphinScheduler 调度**：4 节点串行工作流已上线，全局参数 `bizdate` 支持 T+1 与补数
 - [ ] **定时调度**：配置每日 02:10 的 cron 与告警（工作流已就绪，定时任务尚未启用）
 - [ ] **Superset 可视化**：接入 HiveServer2，把 ADS 七张表做成看板
-- [ ] **ADS SQL 优化**：校验合并、RFM/留存窗口裁剪、中间表消除重复扫描（[`docs/07`](docs/07_ADS_SQL优化方案.md)），目标 ADS 1330 s → 550 s
+- [x] **ADS SQL 优化**：校验合并、留存去 DISTINCT、日期下推、CLI 合并（[`docs/07`](docs/07_ADS_SQL优化方案.md)），实测单天 ADS 1385 s → 1062 s（−23%），数据指纹零漂移
 - [ ] **执行引擎评估**：已完成 MR 与 Spark 的对比（[`docs/08`](docs/08_MR与Spark引擎评估.md)）。本场景换 Spark 只提速约 30%，低于 SQL 改造的 55%，且与后者收益重叠，结论为**暂不更换**；待单天分区 > 5 GB 时重新评估
 - [ ] **DIM 维度层**：扩展 `dim_user_first_active` 为完整用户维度，品类维度补 SCD2 缓慢变化维
